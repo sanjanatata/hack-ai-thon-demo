@@ -109,6 +109,8 @@ def get_property(property_id: str):
             "question_format": g.question_format,
             "last_mention_days_ago": g.last_mention_days_ago,
             "fill_rate": g.fill_rate,
+            "listing_missingness": getattr(g, "listing_missingness", None),
+            "missing_description_fields": getattr(g, "missing_description_fields", []),
             "status": g.status,
         })
 
@@ -165,6 +167,8 @@ def generate_questions(property_id: str, body: ReviewSubmission):
             "final_rank": gap.final_rank,
             "status": "asked" if i < 2 else "queued",
             "skipped": gap.topic in already_covered,
+            "listing_missingness": getattr(gap, "listing_missingness", None),
+            "missing_description_fields": getattr(gap, "missing_description_fields", []),
         })
 
     return {

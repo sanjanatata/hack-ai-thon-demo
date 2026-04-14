@@ -293,7 +293,7 @@ AMENITY_OPTION_PATTERNS: Dict[str, List[str]] = {
     "Breakfast": [r"\bbreakfast\b", r"\bcontinental breakfast\b"],
     "Pool": [r"\bpool\b", r"\bswimming pool\b"],
     "Gym": [r"\bgym\b", r"\bfitness (center|centre|room)\b", r"\bworkout room\b"],
-    "Restaurant/Bar": [r"\brestaurant\b", r"\bbar\b", r"\bdining\b", r"\bdinner\b"],
+    "Restaurant/Bar": [r"\brestaurants?\b", r"\bbar\b", r"\bdining\b", r"\bdinner\b"],
     "Wi‑Fi": [r"\bwi[\s-]?fi\b", r"\bwifi\b", r"\binternet\b"],
     "Parking": [r"\bparking\b", r"\bgarage\b", r"\bvalet\b", r"\bstreet parking\b"],
 }
@@ -441,8 +441,10 @@ class ReviewQuestionModel:
     def _staleness_for_property(self, pid: str, category: Category, today: date) -> Tuple[float, Optional[int]]:
         last = self._last_mention_by_property.get((pid, category))
         if last is None:
-            # No review evidence yet: treat as stale/unknown
-            return 0.9, None
+            # No review evidence yet: treat as "unknown", but do not let this dominate ranking.
+            # Otherwise we over-prioritize topics simply because no one has mentioned them yet,
+            # which tends to create irrelevant questions for short review histories.
+            return 0.2, None
         days = _days_between(last, today)
         if days is None:
             return 0.9, None

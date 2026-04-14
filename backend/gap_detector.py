@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -13,6 +14,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+
+from backend.topic_detector import load_topic_detector_model
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,6 +47,52 @@ TOPIC_CATEGORIES = [
     "accessibility",
     "pets",
 ]
+
+# Description fields per topic (field-level missingness for ranking).
+# These map to columns in `Description_PROC_en.csv`.
+TOPIC_DESCRIPTION_FIELDS: Dict[str, List[str]] = {
+    "service_checkin": [
+        "check_in_start_time",
+        "check_in_end_time",
+        "check_in_instructions",
+        "check_out_time",
+        "check_out_policy",
+    ],
+    "ambiance_decor": [
+        "property_description",
+        "property_amenity_more",
+    ],
+    "affordability": [
+        # Weak proxy; we still track listing missingness where possible.
+        "popular_amenities_list",
+    ],
+    "amenities_food": [
+        "popular_amenities_list",
+        "property_amenity_food_and_drink",
+        "property_amenity_things_to_do",
+        "property_amenity_spa",
+        "property_amenity_parking",
+        "property_amenity_internet",
+        "property_amenity_family_friendly",
+        "property_amenity_conveniences",
+    ],
+    "cleanliness": [
+        # Typically derived from reviews; only a weak listing proxy exists.
+        "know_before_you_go",
+    ],
+    "location_transportation": [
+        "area_description",
+        "city",
+        "province",
+        "country",
+    ],
+    "accessibility": [
+        "property_amenity_accessibility",
+    ],
+    "pets": [
+        "pet_policy",
+    ],
+}
 
 # Keywords per topic
 TOPIC_KEYWORDS: Dict[str, List[str]] = {
@@ -133,6 +182,8 @@ class GapEntry:
     question_format: str    # "binary", "rating_scale", "multi_select", "short_text"
     last_mention_days_ago: Optional[int] = None
     fill_rate: Optional[float] = None
+    listing_missingness: Optional[float] = None
+    missing_description_fields: List[str] = field(default_factory=list)
     status: str = "queued"  # "asked" | "queued"
 
 
@@ -147,6 +198,9 @@ class PropertyGapSummary:
     total_reviews: int
     avg_rating: float
     gaps: List[GapEntry]
+    # A small subset of listing fields used to ground follow-up questions.
+    # This is NOT the full listing; it's limited to the fields we score gaps on.
+    listing_fields: Dict[str, str] = field(default_factory=dict)
     reviewer_archetype: str = "unknown"
     already_covered_topics: List[str] = field(default_factory=list)
     top_questions: List[Dict[str, Any]] = field(default_factory=list)
@@ -200,6 +254,21 @@ def _parse_list_field(raw: str) -> List[str]:
         return json.loads(raw)
     except Exception:
         return [raw]
+
+
+def _is_missing_desc_value(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, float) and pd.isna(v):
+        return True
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return True
+        # Common "empty list" encodings in this dataset.
+        if s in ("[]", "{}", "null", "None"):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +466,13 @@ class GapDetector:
             pet_policy_raw=pet_policy_raw,
         )
 
+        # Keep a small, stable set of listing fields to ground question generation.
+        fields: List[str] = sorted({f for fs in TOPIC_DESCRIPTION_FIELDS.values() for f in fs})
+        listing_fields: Dict[str, str] = {}
+        for f in fields:
+            if f in self.desc.columns:
+                listing_fields[f] = str(row.get(f, "") or "")
+
         return PropertyGapSummary(
             property_id=pid,
             city=city,
@@ -407,7 +483,28 @@ class GapDetector:
             total_reviews=len(prop_reviews),
             avg_rating=round(avg_rating, 2),
             gaps=gaps,
+            listing_fields=listing_fields,
         )
+
+    def _listing_missingness_for_topic(self, pid: str, topic: str) -> Tuple[float, List[str]]:
+        """
+        Compute field-level listing missingness for a topic, using Description_PROC columns.
+        Returns (missing_ratio, missing_fields).
+        """
+        if pid not in self.desc.index:
+            fields = TOPIC_DESCRIPTION_FIELDS.get(topic, [])
+            return (1.0 if fields else 0.0), list(fields)
+
+        row = self.desc.loc[pid]
+        fields = TOPIC_DESCRIPTION_FIELDS.get(topic, [])
+        if not fields:
+            return 0.0, []
+
+        missing: List[str] = []
+        for f in fields:
+            if f not in self.desc.columns or _is_missing_desc_value(row.get(f)):
+                missing.append(f)
+        return len(missing) / max(1, len(fields)), missing
 
     def _compute_fill_rates(self, ratings_list: List[Dict]) -> Dict[str, float]:
         """Compute fill rate per field treating 0.0 as missing."""
@@ -516,6 +613,26 @@ class GapDetector:
     ) -> List[GapEntry]:
         gaps: List[GapEntry] = []
 
+        def _gap_score(
+            *,
+            staleness: float,
+            demand: float,
+            reviewer_fit: float,
+            listing_missingness: float,
+        ) -> float:
+            """
+            Unified scoring that explicitly rewards field-level description gaps.
+
+            We keep staleness/demand/fit (spec-aligned), but add a listing gap term so
+            the top questions consistently target missing Description_PROC fields.
+            """
+            return (
+                0.25 * float(staleness)
+                + 0.35 * float(demand)
+                + 0.15 * float(reviewer_fit)
+                + 0.25 * float(listing_missingness)
+            )
+
         # --- Pet contradiction (highest priority if Monterey-like) ---
         pet_contradict, pet_pct = pet_contradiction
         if pet_contradict:
@@ -524,7 +641,13 @@ class GapDetector:
             staleness = 1.0  # contradiction is always maximally stale
             demand = FUTURE_GUEST_DEMAND["pets"]
             reviewer_fit = 0.6
-            gap_score = staleness * 0.4 + demand * 0.4 + reviewer_fit * 0.2
+            listing_miss, missing_fields = self._listing_missingness_for_topic(pid, "pets")
+            gap_score = _gap_score(
+                staleness=staleness,
+                demand=demand,
+                reviewer_fit=reviewer_fit,
+                listing_missingness=listing_miss,
+            )
             friction = FRICTION_COST["binary"]
             gaps.append(GapEntry(
                 topic="pets",
@@ -538,6 +661,8 @@ class GapDetector:
                 question_format="binary",
                 last_mention_days_ago=days_ago,
                 fill_rate=pet_pct,
+                listing_missingness=round(listing_miss, 3),
+                missing_description_fields=missing_fields,
                 status="queued",
             ))
 
@@ -563,7 +688,13 @@ class GapDetector:
             staleness = 0.9
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.5
-            gap_score = staleness * 0.4 + demand * 0.4 + reviewer_fit * 0.2
+            listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
+            gap_score = _gap_score(
+                staleness=staleness,
+                demand=demand,
+                reviewer_fit=reviewer_fit,
+                listing_missingness=listing_miss,
+            )
             fmt = "rating_scale" if "value" in field_name or "quality" in field_name else "binary"
             friction = FRICTION_COST[fmt]
             gaps.append(GapEntry(
@@ -578,6 +709,8 @@ class GapDetector:
                 question_format=fmt,
                 last_mention_days_ago=days_ago,
                 fill_rate=fr,
+                listing_missingness=round(listing_miss, 3),
+                missing_description_fields=missing_fields,
                 status="queued",
             ))
 
@@ -601,7 +734,13 @@ class GapDetector:
             staleness = max(0.4, 1.0 - actual_fill)
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.5
-            gap_score = staleness * 0.4 + demand * 0.4 + reviewer_fit * 0.2
+            listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
+            gap_score = _gap_score(
+                staleness=staleness,
+                demand=demand,
+                reviewer_fit=reviewer_fit,
+                listing_missingness=listing_miss,
+            )
             friction = FRICTION_COST["rating_scale"]
             gaps.append(GapEntry(
                 topic=topic,
@@ -615,6 +754,8 @@ class GapDetector:
                 question_format="rating_scale",
                 last_mention_days_ago=days_ago,
                 fill_rate=round(actual_fill, 3),
+                listing_missingness=round(listing_miss, 3),
+                missing_description_fields=missing_fields,
                 status="queued",
             ))
 
@@ -635,7 +776,13 @@ class GapDetector:
             staleness = 0.9
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.3)
             reviewer_fit = 0.7
-            gap_score = staleness * 0.4 + demand * 0.4 + reviewer_fit * 0.2
+            listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
+            gap_score = _gap_score(
+                staleness=staleness,
+                demand=demand,
+                reviewer_fit=reviewer_fit,
+                listing_missingness=listing_miss,
+            )
             friction = FRICTION_COST["short_text"]
             gaps.append(GapEntry(
                 topic=topic,
@@ -648,8 +795,50 @@ class GapDetector:
                 final_rank=round(gap_score / friction, 4),
                 question_format="short_text",
                 last_mention_days_ago=days_ago,
+                listing_missingness=round(listing_miss, 3),
+                missing_description_fields=missing_fields,
                 status="queued",
             ))
+
+        # --- Field-level listing missingness (prioritize real Description_PROC gaps) ---
+        # Add a listing-missing gap per topic if the listing is meaningfully incomplete.
+        for topic in TOPIC_CATEGORIES:
+            if topic in seen_topics:
+                continue
+            listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
+            if listing_miss < 0.4:
+                continue
+            # If the listing is missing key fields, we want to ask even if review recency isn't stale.
+            last = topic_last_mention.get(topic)
+            days_ago = (self.today - last).days if last else None
+            staleness = 0.2 if last else 0.4
+            demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
+            reviewer_fit = 0.5
+            gap_score = _gap_score(
+                staleness=staleness,
+                demand=demand,
+                reviewer_fit=reviewer_fit,
+                listing_missingness=listing_miss,
+            )
+            friction = FRICTION_COST["binary"]
+            gaps.append(
+                GapEntry(
+                    topic=topic,
+                    gap_type="listing_missing",
+                    staleness_weight=round(staleness, 3),
+                    future_guest_demand=demand,
+                    reviewer_fit=reviewer_fit,
+                    gap_score=round(gap_score, 3),
+                    friction_cost=friction,
+                    final_rank=round(gap_score / friction, 4),
+                    question_format="binary",
+                    last_mention_days_ago=days_ago,
+                    fill_rate=None,
+                    listing_missingness=round(listing_miss, 3),
+                    missing_description_fields=missing_fields,
+                    status="queued",
+                )
+            )
 
         # --- Recency staleness for remaining topics ---
         for topic in TOPIC_CATEGORIES:
@@ -673,7 +862,13 @@ class GapDetector:
                 continue
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.4
-            gap_score = staleness * 0.4 + demand * 0.4 + reviewer_fit * 0.2
+            listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
+            gap_score = _gap_score(
+                staleness=staleness,
+                demand=demand,
+                reviewer_fit=reviewer_fit,
+                listing_missingness=listing_miss,
+            )
             friction = FRICTION_COST["binary"]
             if gap_score < 0.3:
                 continue
@@ -688,6 +883,8 @@ class GapDetector:
                 final_rank=round(gap_score / friction, 4),
                 question_format="binary",
                 last_mention_days_ago=days_ago,
+                listing_missingness=round(listing_miss, 3),
+                missing_description_fields=missing_fields,
                 status="queued",
             ))
 
@@ -723,7 +920,18 @@ def infer_archetype(review_text: str) -> str:
 
 def covered_topics(review_text: str) -> List[str]:
     """Return list of topics already addressed in the review."""
-    covered = []
+    # Prefer the trained detector when available; fall back to keyword rules.
+    # This makes "already covered" detection robust to paraphrases and synonyms.
+    model_path = os.getenv("TOPIC_DETECTOR_MODEL_PATH")
+    model = load_topic_detector_model(
+        Path(model_path)
+        if model_path
+        else (Path(__file__).parent / "models" / "topic_detector.json")
+    )
+    if model is not None:
+        return model.covered_topics(review_text)
+
+    covered: List[str] = []
     for topic, kws in TOPIC_KEYWORDS.items():
         if _has_any(review_text, kws):
             covered.append(topic)

@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import anthropic
 
 from backend.gap_detector import GapEntry, PropertyGapSummary, covered_topics
+from backend.topic_detector import load_topic_detector_model
 
 # ---------------------------------------------------------------------------
 # Prompt templates per gap type
@@ -28,6 +30,7 @@ Rules:
 - For rating gaps: use a 1–5 star scale as options ["1", "2", "3", "4", "5"]
 - For policy clarification: binary + optional detail
 - Sound human, not like a survey
+- Focus ONLY on the given topic and the missing listing fields; do not drift to unrelated topics.
 
 Return ONLY valid JSON with this exact shape:
 {
@@ -48,6 +51,12 @@ def _build_user_prompt(
 
     gap_description = _describe_gap(gap, property_summary)
 
+    missing_fields = list(getattr(gap, "missing_description_fields", []) or [])
+    listing_snapshot = {
+        f: (property_summary.listing_fields.get(f, "") if hasattr(property_summary, "listing_fields") else "")
+        for f in missing_fields
+    }
+
     return json.dumps({
         "property": {
             "city": property_summary.city,
@@ -60,6 +69,9 @@ def _build_user_prompt(
             "gap_type": gap.gap_type,
             "description": gap_description,
             "question_format": gap.question_format,
+            "listing_missingness": getattr(gap, "listing_missingness", None),
+            "missing_description_fields": missing_fields,
+            "listing_field_values": listing_snapshot,
         },
         "reviewer_context": {
             "archetype": archetype,
@@ -74,6 +86,12 @@ def _describe_gap(gap: GapEntry, summary: PropertyGapSummary) -> str:
         return (
             f"Listing says '{summary.pet_policy}' but {int((gap.fill_rate or 0) * 100)}% of "
             f"reviews mention pets/dogs/cats. Need clarification from guests."
+        )
+    if gap.gap_type == "listing_missing":
+        fields = ", ".join(gap.missing_description_fields[:6]) if gap.missing_description_fields else "unknown fields"
+        return (
+            f"Listing is missing key description fields for this topic ({fields}). "
+            f"Need guest input to fill the listing gaps."
         )
     if gap.gap_type == "zero_fill":
         return f"Rating field '{gap.topic}' has never been filled in (0% fill rate). Need guest input."
@@ -142,6 +160,32 @@ _TEMPLATE_QUESTIONS: Dict[str, Dict[str, Any]] = {
         "answer_format": "short_text",
         "options": None,
     },
+    # Listing-missing fallbacks (field-targeted)
+    "service_checkin_listing_missing": {
+        "question_text": "What time did you actually check in, and was it straightforward?",
+        "answer_format": "short_text",
+        "options": None,
+    },
+    "location_transportation_listing_missing": {
+        "question_text": "How convenient did the location feel for getting around?",
+        "answer_format": "rating_scale",
+        "options": ["1", "2", "3", "4", "5"],
+    },
+    "amenities_food_listing_missing": {
+        "question_text": "Which amenities were actually open and available during your stay?",
+        "answer_format": "short_text",
+        "options": None,
+    },
+    "ambiance_decor_listing_missing": {
+        "question_text": "Did the property feel updated or a bit dated?",
+        "answer_format": "binary",
+        "options": ["Yes", "No", "Not sure"],
+    },
+    "accessibility_listing_missing": {
+        "question_text": "Was there step-free access from the entrance to your room?",
+        "answer_format": "binary",
+        "options": ["Yes", "No", "Not sure"],
+    },
 }
 
 
@@ -187,6 +231,51 @@ class QuestionGenerator:
                 self._client = anthropic.Anthropic(api_key=api_key)
             except Exception:
                 self._client = None
+        model_path = os.getenv("TOPIC_DETECTOR_MODEL_PATH") or (Path(__file__).parent / "models" / "topic_detector.json")
+        self._topic_model = load_topic_detector_model(model_path)
+
+    def _validate_question(
+        self,
+        q: Dict[str, Any],
+        *,
+        gap: GapEntry,
+        review_text: str,
+    ) -> bool:
+        text = str(q.get("question_text", "")).strip()
+        fmt = str(q.get("answer_format", "")).strip()
+        options = q.get("options", None)
+
+        if not text or len(text.split()) > 20:
+            return False
+        if fmt not in ("binary", "rating_scale", "short_text"):
+            return False
+
+        # Strict option shapes for constrained formats.
+        if fmt == "binary":
+            if not isinstance(options, list) or [str(o) for o in options] != ["Yes", "No", "Not sure"]:
+                return False
+        if fmt == "rating_scale":
+            if not isinstance(options, list) or [str(o) for o in options] != ["1", "2", "3", "4", "5"]:
+                return False
+        if fmt == "short_text":
+            if options is not None:
+                return False
+
+        # Don't ask about already-covered topics (extra guard beyond system prompt).
+        already = set(covered_topics(review_text))
+        if gap.topic in already:
+            return False
+
+        # Topic drift guard: the question text should primarily map to the gap topic.
+        if self._topic_model is not None:
+            predicted = set(self._topic_model.covered_topics(text))
+            if predicted and (gap.topic not in predicted):
+                return False
+            # Also reject if it strongly hits a different topic.
+            if any(t in predicted for t in already):
+                return False
+
+        return True
 
     def generate_question(
         self,
@@ -219,8 +308,7 @@ class QuestionGenerator:
             if start >= 0 and end > start:
                 q = json.loads(text[start:end])
                 q["source"] = "llm"
-                # Validate required fields
-                if "question_text" in q and "answer_format" in q:
+                if self._validate_question(q, gap=gap, review_text=review_text):
                     return q
         except Exception:
             pass
@@ -243,7 +331,28 @@ class QuestionGenerator:
         already_covered = set(covered_topics(review_text))
         questions = []
 
-        for gap in property_summary.gaps:
+        # Prefer field-level listing gaps so we consistently fill missing Description fields.
+        priority = {
+            "listing_missing": 6,
+            "policy_contradiction": 5,
+            "zero_fill": 4,
+            "sparse_fill": 3,
+            "score_drift": 2,
+            "staleness": 1,
+        }
+
+        def _pick_score(g: GapEntry) -> tuple[float, float, float]:
+            # Higher is better
+            p = float(priority.get(g.gap_type, 0))
+            listing = float(getattr(g, "listing_missingness", 0.0) or 0.0)
+            rank = float(getattr(g, "final_rank", 0.0) or 0.0)
+            # If we know which fields are missing, that’s even more actionable.
+            has_fields = 1.0 if (getattr(g, "missing_description_fields", None) or []) else 0.0
+            return (p, has_fields + listing, rank)
+
+        gaps = sorted(property_summary.gaps, key=_pick_score, reverse=True)
+
+        for gap in gaps:
             if len(questions) >= k:
                 break
             if gap.topic in already_covered:
