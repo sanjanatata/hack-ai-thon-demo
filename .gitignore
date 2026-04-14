@@ -28,4 +28,4 @@ ENV/
 .vscode/
 .idea/
 
-**/.env
+**/.env.env
