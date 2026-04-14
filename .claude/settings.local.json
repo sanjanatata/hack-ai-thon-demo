@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import sys,csv; r=csv.reader\\(sys.stdin\\); print\\('\\\\n'.join\\(next\\(r\\)\\)\\)\")",
+      "Bash(pip install:*)",
+      "Bash(python3 -c ':*)",
+      "Bash(python3 -c \"import pandas; print\\('ok', pandas.__version__\\)\")",
+      "Bash(/Users/sanjanatata/miniconda3/bin/python3 -c \"import pandas; print\\('pandas ok'\\)\")",
+      "Bash(/Users/sanjanatata/miniconda3/bin/python3 -c ':*)"
+    ]
+  }
+}
