@@ -1,0 +1,30 @@
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Local caches / translation artifacts
+.cache/
+.xdg/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Editor/IDE
+.vscode/
+.idea/
+
