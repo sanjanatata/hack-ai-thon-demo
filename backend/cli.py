@@ -14,6 +14,8 @@ def main() -> None:
     p.add_argument("--review-text", required=True, help="Review text the traveler is writing")
     p.add_argument("--acquisition-date", default=None, help="Optional review date mm/dd/yy")
     p.add_argument("--k", type=int, default=2, help="How many follow-up questions to return")
+    p.add_argument("--use-llm", action="store_true", help="Use LLM layer for varied constrained questions")
+    p.add_argument("--llm-model", default="gpt-4o-mini", help="LLM model name when --use-llm is enabled")
     args = p.parse_args()
 
     model = ReviewQuestionModel.load_from_normalized(
@@ -27,6 +29,8 @@ def main() -> None:
         review_text=args.review_text,
         acquisition_date=args.acquisition_date,
         k=args.k,
+        use_llm=args.use_llm,
+        llm_model=args.llm_model,
     )
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
