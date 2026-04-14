@@ -1,5 +1,5 @@
 """
-LLM-backed question generation using Claude Haiku via the Anthropic SDK.
+LLM-backed question generation using OpenAI Chat Completions.
 Generates natural, conversational follow-up questions for hotel reviews.
 """
 from __future__ import annotations
@@ -7,10 +7,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import anthropic
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from backend.gap_detector import GapEntry, PropertyGapSummary, covered_topics
 from backend.topic_detector import load_topic_detector_model
@@ -220,19 +222,46 @@ def _get_template_question(gap: GapEntry) -> Dict[str, Any]:
 class QuestionGenerator:
     """
     Generates natural-language follow-up questions for hotel reviews.
-    Uses Claude Haiku via Anthropic SDK with template fallback.
+    Uses OpenAI Chat Completions with template fallback.
     """
 
     def __init__(self):
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        self._client: Optional[anthropic.Anthropic] = None
-        if api_key:
-            try:
-                self._client = anthropic.Anthropic(api_key=api_key)
-            except Exception:
-                self._client = None
+        self._api_key = os.getenv("OPENAI_API_KEY")
+        self._base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        self._model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         model_path = os.getenv("TOPIC_DETECTOR_MODEL_PATH") or (Path(__file__).parent / "models" / "topic_detector.json")
         self._topic_model = load_topic_detector_model(model_path)
+
+    def _call_openai_json(self, system_prompt: str, user_prompt: str) -> Optional[Dict[str, Any]]:
+        if not self._api_key:
+            return None
+        payload = {
+            "model": self._model,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+        }
+        req = urllib_request.Request(
+            f"{self._base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=20) as response:
+                body = json.loads(response.read().decode("utf-8"))
+                content = body["choices"][0]["message"]["content"]
+                if not isinstance(content, str) or not content.strip():
+                    return None
+                return json.loads(content)
+        except (urllib_error.URLError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+            return None
 
     def _validate_question(
         self,
@@ -285,28 +314,15 @@ class QuestionGenerator:
         archetype: str,
     ) -> Dict[str, Any]:
         """Generate a single question for the given gap. Falls back to template on error."""
-        if self._client is None:
+        if not self._api_key:
             q = _get_template_question(gap)
             q["source"] = "template"
             return q
 
         try:
             user_prompt = _build_user_prompt(gap, property_summary, review_text, archetype)
-            response = self._client.messages.create(
-                model="claude-haiku-4-5",
-                max_tokens=256,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            text = next(
-                (b.text for b in response.content if b.type == "text"), ""
-            )
-            # Parse JSON from response
-            # Find JSON object in response
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start >= 0 and end > start:
-                q = json.loads(text[start:end])
+            q = self._call_openai_json(_SYSTEM_PROMPT, user_prompt)
+            if isinstance(q, dict):
                 q["source"] = "llm"
                 if self._validate_question(q, gap=gap, review_text=review_text):
                     return q
@@ -350,13 +366,41 @@ class QuestionGenerator:
             has_fields = 1.0 if (getattr(g, "missing_description_fields", None) or []) else 0.0
             return (p, has_fields + listing, rank)
 
-        gaps = sorted(property_summary.gaps, key=_pick_score, reverse=True)
+        gaps_sorted = sorted(property_summary.gaps, key=_pick_score, reverse=True)
+        # Diversify: don't always take the exact top-2 for a property.
+        # We select from the top-N eligible gaps, but in a stable way keyed to (property, review_text)
+        # so the same review remains consistent across refreshes.
+        seed_material = f"{property_summary.property_id}\n{review_text}".encode("utf-8", errors="ignore")
+        seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+        rng = random.Random(seed)
 
-        for gap in gaps:
+        # Filter eligible gaps first (skip covered topics).
+        eligible = [g for g in gaps_sorted if g.topic not in already_covered]
+        head_n = min(len(eligible), max(8, k * 4))
+        head = eligible[:head_n]
+        tail = eligible[head_n:]
+
+        # Shuffle within buckets by (gap_type priority, listing_missingness band) to keep "good" gaps,
+        # but vary the ordering enough to avoid always the same 2.
+        def _bucket(g: GapEntry) -> tuple[float, int]:
+            p = float(priority.get(g.gap_type, 0))
+            listing = float(getattr(g, "listing_missingness", 0.0) or 0.0)
+            band = int(listing * 10)  # 0..10
+            return (p, band)
+
+        by_bucket: Dict[tuple[float, int], List[GapEntry]] = {}
+        for g in head:
+            by_bucket.setdefault(_bucket(g), []).append(g)
+        ordered: List[GapEntry] = []
+        for b in sorted(by_bucket.keys(), reverse=True):
+            items = by_bucket[b]
+            rng.shuffle(items)
+            ordered.extend(items)
+        ordered.extend(tail)
+
+        for gap in ordered:
             if len(questions) >= k:
                 break
-            if gap.topic in already_covered:
-                continue
 
             q = self.generate_question(gap, property_summary, review_text, archetype)
             q["gap_topic"] = gap.topic

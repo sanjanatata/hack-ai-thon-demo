@@ -4,6 +4,7 @@ FastAPI backend for the Smart Review Gap-Filler prototype.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -39,9 +40,34 @@ _detector: Optional[GapDetector] = None
 _generator: Optional[QuestionGenerator] = None
 
 
+def _load_env_file(path: Path) -> None:
+    """
+    Minimal .env loader so local runs pick up OPENAI_API_KEY, etc.
+    (We avoid adding a hard dependency on python-dotenv.)
+    """
+    if not path.exists():
+        return
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        # Remove optional surrounding quotes.
+        value = re.sub(r'^["\'](.*)["\']$', r"\1", value)
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def get_detector() -> GapDetector:
     global _detector
     if _detector is None:
+        _load_env_file(Path(__file__).parent.parent / ".env")
         _detector = GapDetector.load(DATA_DIR)
         _detector.train()
     return _detector
@@ -50,6 +76,7 @@ def get_detector() -> GapDetector:
 def get_generator() -> QuestionGenerator:
     global _generator
     if _generator is None:
+        _load_env_file(Path(__file__).parent.parent / ".env")
         _generator = QuestionGenerator()
     return _generator
 
