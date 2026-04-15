@@ -1,6 +1,8 @@
 """
 FastAPI backend for the Smart Review Gap-Filler prototype.
 """
+
+
 from __future__ import annotations
 
 import os
@@ -8,6 +10,10 @@ import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+print(f"[startup] OPENAI_API_KEY loaded: {bool(os.getenv('OPENAI_API_KEY'))}")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -171,18 +177,26 @@ def generate_questions(property_id: str, body: ReviewSubmission):
     if summary is None:
         raise HTTPException(status_code=404, detail="Property not found")
 
-    archetype = body.archetype or infer_archetype(body.review_text)
-    already_covered = covered_topics(body.review_text)
+    review_text = body.review_text
+    if body.archetype:
+        archetype, confidence = body.archetype, 1.0
+    else:
+        archetype, confidence = infer_archetype(review_text)
+    already_covered = covered_topics(review_text)
 
     # Generate top-2 questions
     questions = generator.generate_questions_for_review(
         property_summary=summary,
-        review_text=body.review_text,
+        review_text=review_text,
         archetype=archetype,
+        confidence=confidence,
         k=2,
     )
 
+    print(f"[questions] archetype='{archetype}' confidence={confidence:.2f} covered={list(already_covered)} asked={[q['gap_topic'] for q in questions]}")
+
     # Build full gap queue for judge display
+    asked_topics = {q["gap_topic"] for q in questions}
     gap_queue = []
     for i, gap in enumerate(summary.gaps[:7]):
         gap_queue.append({
@@ -192,7 +206,7 @@ def generate_questions(property_id: str, body: ReviewSubmission):
             "gap_score": gap.gap_score,
             "friction_cost": gap.friction_cost,
             "final_rank": gap.final_rank,
-            "status": "asked" if i < 2 else "queued",
+            "status": "asked" if gap.topic in asked_topics else "queued",
             "skipped": gap.topic in already_covered,
             "listing_missingness": getattr(gap, "listing_missingness", None),
             "missing_description_fields": getattr(gap, "missing_description_fields", []),
@@ -201,6 +215,7 @@ def generate_questions(property_id: str, body: ReviewSubmission):
     return {
         "questions": questions,
         "archetype": archetype,
+        "archetype_confidence": round(confidence, 2),
         "already_covered_topics": already_covered,
         "gap_queue": gap_queue,
         "property": {

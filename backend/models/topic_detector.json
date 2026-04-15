@@ -16,7 +16,7 @@
     "amenities_food": -0.6605102512469228,
     "cleanliness": -0.6434319550174167,
     "location_transportation": -0.6787584431078456,
-    "pets": 0.0,
+    "pets": -2.5,
     "service_checkin": -0.3368019160109952
   },
   "weights": {
@@ -2132,7 +2132,23 @@
       "apply": 1.77880032458555,
       "insufficient": 1.77880032458555
     },
-    "pets": {},
+    "pets": {
+      "dog": 8.5,
+      "dogs": 8.5,
+      "pet": 8.0,
+      "pets": 8.0,
+      "puppy": 7.5,
+      "pooch": 7.5,
+      "canine": 7.5,
+      "kitten": 7.5,
+      "leash": 7.0,
+      "fur": 6.5,
+      "paw": 6.5,
+      "bark": 6.0,
+      "feline": 6.0,
+      "animal": 4.0,
+      "brought": 2.0
+    },
     "service_checkin": {
       "staff": 8.571818729904287,
       "friendly": 7.22344970951947,

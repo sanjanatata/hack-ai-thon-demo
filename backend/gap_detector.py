@@ -113,6 +113,8 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "breakfast", "restaurant", "bar", "food", "dinner", "coffee",
         "pool", "gym", "spa", "wifi", "internet", "parking", "room service",
         "amenit", "closed", "vending", "microwave",
+        "meal", "menu", "dining", "baby food",
+        "air conditioning", "ac", "hvac", "heater", "heating",
     ],
     "cleanliness": [
         "clean", "dirty", "filthy", "smell", "mold", "stain", "bugs",
@@ -133,7 +135,7 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
     ],
 }
 
-# Future guest demand weights (from spec)
+# Future guest demand weights (from spec) — used in impact panel messaging
 FUTURE_GUEST_DEMAND: Dict[str, float] = {
     "service_checkin": 0.35,
     "cleanliness": 0.26,
@@ -145,7 +147,20 @@ FUTURE_GUEST_DEMAND: Dict[str, float] = {
     "accessibility": 0.02,
 }
 
-# Friction cost per question type
+# Topic demand weights used to scale gap scores — same values but canonical for scoring
+TOPIC_DEMAND: Dict[str, float] = {
+    "service_checkin": 0.35,
+    "cleanliness": 0.26,
+    "location_transportation": 0.20,
+    "pets": 0.19,
+    "amenities_food": 0.12,
+    "affordability": 0.06,
+    "ambiance_decor": 0.07,
+    "accessibility": 0.02,
+    "room_quality": 0.06,
+}
+
+# Friction cost per question format (base values; dynamic multipliers applied at rank time)
 FRICTION_COST: Dict[str, int] = {
     "binary": 1,
     "rating_scale": 2,
@@ -154,15 +169,130 @@ FRICTION_COST: Dict[str, int] = {
     "long_text": 7,
 }
 
-# Reviewer archetype keyword signals
+# Reviewer archetype keyword signals — each key must appear in ARCHETYPE_TOPIC_FIT
 ARCHETYPE_SIGNALS: Dict[str, List[str]] = {
-    "family": ["kids", "children", "family", "son", "daughter", "toddler", "child", "crib"],
-    "couple": ["husband", "wife", "partner", "romantic", "anniversary", "honeymoon", "spouse"],
-    "business": ["work", "business", "conference", "meeting", "corporate", "laptop", "remote work"],
-    "pet_owner": ["dog", "cat", "pet", "brought our", "travel with"],
-    "budget": ["budget", "affordable", "price", "cheap", "value", "economical"],
-    "accessibility": ["wheelchair", "accessible", "disability", "elevator", "grab bar"],
+    "family": [
+        "parent", "child", "kid", "baby", "family", "daughter", "son", "stroller",
+        "kids", "children", "toddler", "crib",
+    ],
+    "couple": [
+        "husband", "wife", "anniversary", "romantic", "couple",
+        "partner", "honeymoon", "spouse",
+    ],
+    "business": [
+        "work", "business", "meeting", "conference", "laptop", "wifi",
+        "corporate", "remote work",
+    ],
+    "leisure": [
+        "vacation", "holiday", "trip", "getaway", "spring break", "summer",
+        "tourist", "sightseeing", "explore", "relax", "weekend",
+    ],
+    "pet_owner": ["dog", "cat", "pet", "puppy", "brought our"],
+    "accessibility": ["wheelchair", "accessible", "disability", "mobility", "elevator", "grab bar"],
 }
+
+# Per-archetype relevance weights for each gap topic.
+# Every key is explicit — no missing keys defaulting silently.
+# fit = 0.0 means the topic is irrelevant: final_rank collapses to 0 and the
+# question is never asked for that archetype.
+# "general" is the blend target for low-confidence inferences.
+ARCHETYPE_TOPIC_FIT: Dict[str, Dict[str, float]] = {
+    "family": {
+        "amenities_food": 0.9,       # pool hours, kids menu
+        "cleanliness": 0.8,
+        "service_checkin": 0.6,
+        "affordability": 0.7,
+        "location_transportation": 0.5,
+        "ambiance_decor": 0.3,
+        "pets": 0.0,                  # families don't have pets on hotel trips
+        "accessibility": 0.1,
+    },
+    "business": {
+        "service_checkin": 0.95,
+        "amenities_food": 0.7,        # wifi, business center
+        "location_transportation": 0.9,
+        "affordability": 0.5,
+        "cleanliness": 0.5,
+        "ambiance_decor": 0.1,
+        "pets": 0.0,
+        "accessibility": 0.1,
+    },
+    "couple": {
+        "ambiance_decor": 0.9,
+        "amenities_food": 0.8,        # bar, restaurant
+        "affordability": 0.6,
+        "cleanliness": 0.6,
+        "service_checkin": 0.5,
+        "location_transportation": 0.5,
+        "pets": 0.0,
+        "accessibility": 0.0,
+    },
+    "leisure": {
+        "amenities_food": 0.85,
+        "ambiance_decor": 0.7,
+        "affordability": 0.8,
+        "cleanliness": 0.6,
+        "location_transportation": 0.6,
+        "service_checkin": 0.5,
+        "pets": 0.0,
+        "accessibility": 0.0,
+    },
+    "pet_owner": {
+        "pets": 1.0,
+        "amenities_food": 0.5,
+        "location_transportation": 0.7,   # walking areas
+        "cleanliness": 0.6,
+        "service_checkin": 0.4,
+        "affordability": 0.5,
+        "ambiance_decor": 0.2,
+        "accessibility": 0.0,
+    },
+    "accessibility": {
+        "accessibility": 1.0,
+        "service_checkin": 0.7,
+        "location_transportation": 0.6,
+        "amenities_food": 0.4,
+        "cleanliness": 0.4,
+        "affordability": 0.3,
+        "ambiance_decor": 0.1,
+        "pets": 0.0,
+    },
+    # Blend target for low-confidence inferences — neutral weights, no pets
+    "general": {
+        "service_checkin": 0.5,
+        "cleanliness": 0.5,
+        "location_transportation": 0.5,
+        "amenities_food": 0.5,
+        "affordability": 0.5,
+        "ambiance_decor": 0.5,
+        "accessibility": 0.3,
+        "pets": 0.0,
+    },
+}
+
+
+def dynamic_final_rank(gap: "GapEntry", archetype: str, confidence: float = 1.0) -> float:
+    """
+    final_rank = (gap_score × demand × fit) / friction_cost
+
+    When confidence < 0.5 the archetype fit is blended toward "general" weights
+    so weak inferences don't fully commit to one traveler profile.
+    fit = 0.0 always produces rank = 0.0 — those topics are never asked.
+    """
+    fit_map = ARCHETYPE_TOPIC_FIT.get(archetype, ARCHETYPE_TOPIC_FIT["general"])
+    general_map = ARCHETYPE_TOPIC_FIT["general"]
+
+    fit_arch = fit_map.get(gap.topic, 0.2)
+    fit_general = general_map.get(gap.topic, 0.2)
+
+    # Blend toward general when confidence is low
+    if confidence < 0.5:
+        fit = confidence * fit_arch + (1.0 - confidence) * fit_general
+    else:
+        fit = fit_arch
+
+    demand = TOPIC_DEMAND.get(gap.topic, 0.1)
+    return (gap.gap_score * demand * fit) / max(gap.friction_cost, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +481,7 @@ class GapDetector:
             ),
             GapEntry(
                 topic="ambiance_decor",
-                gap_type="sparse_fill",
+                gap_type="zero_fill",      # roomquality is 0% filled, not roomcomfort
                 staleness_weight=0.78,
                 future_guest_demand=0.07,
                 reviewer_fit=0.5,
@@ -360,7 +490,7 @@ class GapDetector:
                 final_rank=0.30,
                 question_format="rating_scale",
                 last_mention_days_ago=12,
-                fill_rate=0.22,
+                fill_rate=0.0,             # roomquality actual fill rate from reviews data
                 status="queued",
             ),
             GapEntry(
@@ -615,23 +745,24 @@ class GapDetector:
 
         def _gap_score(
             *,
+            topic: str,
             staleness: float,
-            demand: float,
             reviewer_fit: float,
             listing_missingness: float,
         ) -> float:
             """
-            Unified scoring that explicitly rewards field-level description gaps.
+            gap_score = base_score × TOPIC_DEMAND[topic]
 
-            We keep staleness/demand/fit (spec-aligned), but add a listing gap term so
-            the top questions consistently target missing Description_PROC fields.
+            Multiplying by demand means the same staleness/fill situation scores
+            higher for topics future guests actually search for (service=0.35)
+            than low-demand topics (affordability=0.06).
             """
-            return (
-                0.25 * float(staleness)
-                + 0.35 * float(demand)
-                + 0.15 * float(reviewer_fit)
-                + 0.25 * float(listing_missingness)
+            base = (
+                0.50 * float(staleness)
+                + 0.30 * float(reviewer_fit)
+                + 0.20 * float(listing_missingness)
             )
+            return base * TOPIC_DEMAND.get(topic, 0.1)
 
         # --- Pet contradiction (highest priority if Monterey-like) ---
         pet_contradict, pet_pct = pet_contradiction
@@ -643,8 +774,8 @@ class GapDetector:
             reviewer_fit = 0.6
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, "pets")
             gap_score = _gap_score(
+                topic="pets",
                 staleness=staleness,
-                demand=demand,
                 reviewer_fit=reviewer_fit,
                 listing_missingness=listing_miss,
             )
@@ -690,8 +821,8 @@ class GapDetector:
             reviewer_fit = 0.5
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
             gap_score = _gap_score(
+                topic=topic,
                 staleness=staleness,
-                demand=demand,
                 reviewer_fit=reviewer_fit,
                 listing_missingness=listing_miss,
             )
@@ -736,8 +867,8 @@ class GapDetector:
             reviewer_fit = 0.5
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
             gap_score = _gap_score(
+                topic=topic,
                 staleness=staleness,
-                demand=demand,
                 reviewer_fit=reviewer_fit,
                 listing_missingness=listing_miss,
             )
@@ -778,8 +909,8 @@ class GapDetector:
             reviewer_fit = 0.7
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
             gap_score = _gap_score(
+                topic=topic,
                 staleness=staleness,
-                demand=demand,
                 reviewer_fit=reviewer_fit,
                 listing_missingness=listing_miss,
             )
@@ -815,8 +946,8 @@ class GapDetector:
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.5
             gap_score = _gap_score(
+                topic=topic,
                 staleness=staleness,
-                demand=demand,
                 reviewer_fit=reviewer_fit,
                 listing_missingness=listing_miss,
             )
@@ -864,13 +995,13 @@ class GapDetector:
             reviewer_fit = 0.4
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
             gap_score = _gap_score(
+                topic=topic,
                 staleness=staleness,
-                demand=demand,
                 reviewer_fit=reviewer_fit,
                 listing_missingness=listing_miss,
             )
             friction = FRICTION_COST["binary"]
-            if gap_score < 0.3:
+            if gap_score < 0.03:
                 continue
             gaps.append(GapEntry(
                 topic=topic,
@@ -902,16 +1033,36 @@ class GapDetector:
 # Reviewer archetype inference
 # ---------------------------------------------------------------------------
 
-def infer_archetype(review_text: str) -> str:
-    """Infer traveler archetype from review text keywords."""
+def infer_archetype(review_text: str) -> Tuple[str, float]:
+    """Infer traveler archetype and confidence from review text keywords.
+
+    Returns (archetype, confidence) where confidence is in [0.0, 1.0].
+    Confidence is scaled by how many distinct keywords matched: 1 match = 0.4,
+    2 matches = 0.7, 3+ matches = 1.0. Low confidence (<0.5) causes the
+    dynamic_final_rank() to blend fit toward the "general" weights.
+    """
     text = _normalize(review_text or "")
     scores: Dict[str, int] = {k: 0 for k in ARCHETYPE_SIGNALS}
     for archetype, kws in ARCHETYPE_SIGNALS.items():
         for kw in kws:
             if _has_any(text, [kw]):
                 scores[archetype] += 1
+
     best = max(scores, key=lambda k: scores[k])
-    return best if scores[best] > 0 else "general"
+    best_count = scores[best]
+
+    if best_count == 0:
+        return "general", 0.2
+
+    # Confidence ladder: 1 hit → 0.4, 2 hits → 0.7, 3+ hits → 1.0
+    if best_count == 1:
+        confidence = 0.4
+    elif best_count == 2:
+        confidence = 0.7
+    else:
+        confidence = 1.0
+
+    return best, confidence
 
 
 # ---------------------------------------------------------------------------
@@ -919,18 +1070,12 @@ def infer_archetype(review_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 def covered_topics(review_text: str) -> List[str]:
-    """Return list of topics already addressed in the review."""
-    # Prefer the trained detector when available; fall back to keyword rules.
-    # This makes "already covered" detection robust to paraphrases and synonyms.
-    model_path = os.getenv("TOPIC_DETECTOR_MODEL_PATH")
-    model = load_topic_detector_model(
-        Path(model_path)
-        if model_path
-        else (Path(__file__).parent / "models" / "topic_detector.json")
-    )
-    if model is not None:
-        return model.covered_topics(review_text)
+    """Return list of topics already addressed in the review.
 
+    Uses keyword matching only — deterministic and auditable.
+    The ML model was generating false positives (e.g. service_checkin for
+    "ac stopped working") so it is not used for deduplication.
+    """
     covered: List[str] = []
     for topic, kws in TOPIC_KEYWORDS.items():
         if _has_any(review_text, kws):
@@ -950,7 +1095,14 @@ def build_impact_data(
     """Build before/after impact panel data for one answered gap."""
     demand_pct = int(FUTURE_GUEST_DEMAND.get(gap.topic, 0.1) * 100)
 
-    before_label = "?" if gap.fill_rate == 0 else f"{int((gap.fill_rate or 0) * 100)}% filled"
+    # None → unknown ("?"), 0.0 → "0% filled", else show the actual percentage
+    fill_rate = gap.fill_rate
+    if fill_rate is None:
+        before_label = "?"
+    elif fill_rate == 0.0:
+        before_label = "0% filled"
+    else:
+        before_label = f"{int(fill_rate * 100)}% filled"
     after_label = str(answer)
 
     # How many other answers on same topic (simulated: ~3-5 for demo)
@@ -959,6 +1111,7 @@ def build_impact_data(
     return {
         "topic": gap.topic,
         "gap_type": gap.gap_type,
+        "fill_rate": fill_rate,        # raw value so frontend can format independently
         "before_label": before_label,
         "after_label": after_label,
         "demand_pct": demand_pct,

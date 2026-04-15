@@ -7,14 +7,12 @@ from __future__ import annotations
 import json
 import os
 import re
-import hashlib
-import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from backend.gap_detector import GapEntry, PropertyGapSummary, covered_topics
+from backend.gap_detector import GapEntry, PropertyGapSummary, covered_topics, dynamic_final_rank, ARCHETYPE_TOPIC_FIT
 from backend.topic_detector import load_topic_detector_model
 
 # ---------------------------------------------------------------------------
@@ -338,67 +336,44 @@ class QuestionGenerator:
         property_summary: PropertyGapSummary,
         review_text: str,
         archetype: str,
+        confidence: float = 1.0,
         k: int = 2,
     ) -> List[Dict[str, Any]]:
         """
         Generate k questions for the top-k gaps, skipping topics already covered
-        in the review text.
+        in the review text. confidence is blended into fit via dynamic_final_rank.
         """
         already_covered = set(covered_topics(review_text))
         questions = []
 
-        # Prefer field-level listing gaps so we consistently fill missing Description fields.
-        priority = {
-            "listing_missing": 6,
-            "policy_contradiction": 5,
-            "zero_fill": 4,
-            "sparse_fill": 3,
-            "score_drift": 2,
-            "staleness": 1,
-        }
-
-        def _pick_score(g: GapEntry) -> tuple[float, float, float]:
-            # Higher is better
-            p = float(priority.get(g.gap_type, 0))
-            listing = float(getattr(g, "listing_missingness", 0.0) or 0.0)
-            rank = float(getattr(g, "final_rank", 0.0) or 0.0)
-            # If we know which fields are missing, that’s even more actionable.
-            has_fields = 1.0 if (getattr(g, "missing_description_fields", None) or []) else 0.0
-            return (p, has_fields + listing, rank)
+        def _pick_score(g: GapEntry) -> float:
+            return dynamic_final_rank(g, archetype, confidence)
 
         gaps_sorted = sorted(property_summary.gaps, key=_pick_score, reverse=True)
-        # Diversify: don't always take the exact top-2 for a property.
-        # We select from the top-N eligible gaps, but in a stable way keyed to (property, review_text)
-        # so the same review remains consistent across refreshes.
-        seed_material = f"{property_summary.property_id}\n{review_text}".encode("utf-8", errors="ignore")
-        seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
-        rng = random.Random(seed)
 
-        # Filter eligible gaps first (skip covered topics).
-        eligible = [g for g in gaps_sorted if g.topic not in already_covered]
-        head_n = min(len(eligible), max(8, k * 4))
-        head = eligible[:head_n]
-        tail = eligible[head_n:]
+        # Compute effective fit for each gap (accounting for confidence blending)
+        # and filter out topics with effective fit = 0 (rank already collapses to 0).
+        general_map = ARCHETYPE_TOPIC_FIT["general"]
+        fit_map = ARCHETYPE_TOPIC_FIT.get(archetype, general_map)
 
-        # Shuffle within buckets by (gap_type priority, listing_missingness band) to keep "good" gaps,
-        # but vary the ordering enough to avoid always the same 2.
-        def _bucket(g: GapEntry) -> tuple[float, int]:
-            p = float(priority.get(g.gap_type, 0))
-            listing = float(getattr(g, "listing_missingness", 0.0) or 0.0)
-            band = int(listing * 10)  # 0..10
-            return (p, band)
+        def _effective_fit(g: GapEntry) -> float:
+            fit_arch = fit_map.get(g.topic, 0.2)
+            fit_general = general_map.get(g.topic, 0.2)
+            if confidence < 0.5:
+                return confidence * fit_arch + (1.0 - confidence) * fit_general
+            return fit_arch
 
-        by_bucket: Dict[tuple[float, int], List[GapEntry]] = {}
-        for g in head:
-            by_bucket.setdefault(_bucket(g), []).append(g)
-        ordered: List[GapEntry] = []
-        for b in sorted(by_bucket.keys(), reverse=True):
-            items = by_bucket[b]
-            rng.shuffle(items)
-            ordered.extend(items)
-        ordered.extend(tail)
+        # Filter eligible gaps: skip covered topics and zero-fit topics.
+        eligible = [
+            g for g in gaps_sorted
+            if g.topic not in already_covered and _effective_fit(g) > 0.0
+        ]
 
-        for gap in ordered:
+        # If the fit filter left nothing, fall back to covered-only filter.
+        if not eligible:
+            eligible = [g for g in gaps_sorted if g.topic not in already_covered]
+
+        for gap in eligible:
             if len(questions) >= k:
                 break
 
@@ -407,7 +382,8 @@ class QuestionGenerator:
             q["gap_type"] = gap.gap_type
             q["gap_score"] = gap.gap_score
             q["friction_cost"] = gap.friction_cost
-            q["final_rank"] = gap.final_rank
+            q["final_rank"] = dynamic_final_rank(gap, archetype, confidence)
+            q["fill_rate"] = gap.fill_rate
             questions.append(q)
 
         return questions

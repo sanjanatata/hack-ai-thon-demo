@@ -45,7 +45,7 @@ export default function ImpactPanel({ impacts, answers, archetype, gapQueue, onR
               <div className="bac-columns">
                 <div className="bac-col before">
                   <div className="bac-col-label">Before your answer</div>
-                  <div className="bac-value missing">{impact.before_label}</div>
+                  <div className="bac-value missing">{fillLabel(impact.fill_rate, impact.before_label)}</div>
                 </div>
                 <div className="bac-arrow">→</div>
                 <div className="bac-col after">
@@ -122,6 +122,12 @@ export default function ImpactPanel({ impacts, answers, archetype, gapQueue, onR
       </button>
     </div>
   );
+}
+
+function fillLabel(fillRate, fallback) {
+  if (fillRate === null || fillRate === undefined) return fallback ?? "?";
+  if (fillRate === 0) return "0% filled";
+  return `${Math.round(fillRate * 100)}% filled`;
 }
 
 function topicLabel(topic) {

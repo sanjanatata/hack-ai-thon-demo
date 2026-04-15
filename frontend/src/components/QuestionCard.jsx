@@ -90,7 +90,7 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
               {STAR_VALS.map((v) => (
                 <button
                   key={v}
-                  className={`star-opt ${selectedOption === v ? "selected" : ""}`}
+                  className={`star-opt ${selectedOption && parseInt(v) <= parseInt(selectedOption) ? "selected" : ""}`}
                   onClick={() => setSelectedOption(v)}
                   aria-label={`${v} star`}
                 >
