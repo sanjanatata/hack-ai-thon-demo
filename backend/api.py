@@ -90,9 +90,9 @@ def get_generator() -> QuestionGenerator:
 # Request / Response models
 # ---------------------------------------------------------------------------
 
-class ReviewSubmission(BaseModel):
+class QuestionRequest(BaseModel):
     review_text: str
-    star_rating: int = 4
+    rating: float = 4.0
     archetype: Optional[str] = None  # can be pre-specified or inferred
 
 
@@ -160,7 +160,7 @@ def get_property(property_id: str):
 
 
 @app.post("/api/properties/{property_id}/questions")
-def generate_questions(property_id: str, body: ReviewSubmission):
+def generate_questions(property_id: str, body: QuestionRequest):
     """
     Generate 1–2 follow-up questions for a review in progress.
     Returns:

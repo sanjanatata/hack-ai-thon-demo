@@ -132,6 +132,12 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
     "pets": [
         "pet", "dog", "cat", "puppy", "pooch", "canine", "kitten",
         "animal", "fur baby", "leash",
+        "brought our dog", "brought my dog", "brought our cat", "brought my cat",
+        "brought our pet", "brought my pet",
+        "traveling with my dog", "traveling with my cat", "traveling with my pet",
+        "traveling with our dog", "traveling with our cat", "traveling with our pet",
+        "travelling with my dog", "travelling with my cat", "travelling with my pet",
+        "travelling with our dog", "travelling with our cat", "travelling with our pet",
     ],
 }
 
@@ -256,6 +262,17 @@ ARCHETYPE_TOPIC_FIT: Dict[str, Dict[str, float]] = {
         "affordability": 0.3,
         "ambiance_decor": 0.1,
         "pets": 0.0,
+    },
+    # Business traveler with family — 50/50 blend of business and family weights
+    "business_family": {
+        "service_checkin": 0.775,    # (0.95 + 0.6) / 2
+        "amenities_food": 0.8,       # (0.7 + 0.9) / 2 — pulls amenities above affordability
+        "location_transportation": 0.7,  # (0.9 + 0.5) / 2
+        "affordability": 0.6,        # (0.5 + 0.7) / 2
+        "cleanliness": 0.65,         # (0.5 + 0.8) / 2
+        "ambiance_decor": 0.2,       # (0.1 + 0.3) / 2
+        "pets": 0.0,
+        "accessibility": 0.1,        # (0.1 + 0.1) / 2
     },
     # Blend target for low-confidence inferences — neutral weights, no pets
     "general": {
@@ -1038,8 +1055,11 @@ def infer_archetype(review_text: str) -> Tuple[str, float]:
 
     Returns (archetype, confidence) where confidence is in [0.0, 1.0].
     Confidence is scaled by how many distinct keywords matched: 1 match = 0.4,
-    2 matches = 0.7, 3+ matches = 1.0. Low confidence (<0.5) causes the
+    2 matches = 0.8, 3+ matches = 1.0. Low confidence (<0.5) causes the
     dynamic_final_rank() to blend fit toward the "general" weights.
+
+    Special case: when both business (confidence > 0.5) and family (confidence > 0.3)
+    signals are present, returns "business_family" to blend fit maps 50/50.
     """
     text = _normalize(review_text or "")
     scores: Dict[str, int] = {k: 0 for k in ARCHETYPE_SIGNALS}
@@ -1048,21 +1068,31 @@ def infer_archetype(review_text: str) -> Tuple[str, float]:
             if _has_any(text, [kw]):
                 scores[archetype] += 1
 
+    def _conf(count: int) -> float:
+        if count == 0:
+            return 0.0
+        if count == 1:
+            return 0.4
+        if count == 2:
+            return 0.8
+        return 1.0
+
+    # Business + family blend: business traveler with kids
+    biz_conf = _conf(scores["business"])
+    fam_conf = _conf(scores["family"])
+    if biz_conf > 0.5 and fam_conf > 0.3:
+        return "business_family", biz_conf
+
     best = max(scores, key=lambda k: scores[k])
     best_count = scores[best]
 
     if best_count == 0:
         return "general", 0.2
 
-    # Confidence ladder: 1 hit → 0.4, 2 hits → 0.7, 3+ hits → 1.0
-    if best_count == 1:
-        confidence = 0.4
-    elif best_count == 2:
-        confidence = 0.7
-    else:
-        confidence = 1.0
+    return best, _conf(best_count)
 
-    return best, confidence
+
+assert infer_archetype("me and my wife came for our anniversary")[0] == "couple"
 
 
 # ---------------------------------------------------------------------------

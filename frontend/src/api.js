@@ -14,7 +14,7 @@ export async function generateQuestions(propertyId, reviewText, starRating) {
   const r = await fetch(`${BASE}/properties/${propertyId}/questions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ review_text: reviewText, star_rating: starRating }),
+    body: JSON.stringify({ review_text: reviewText, rating: starRating }),
   });
   return r.json();
 }

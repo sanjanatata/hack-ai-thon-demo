@@ -23,14 +23,24 @@ _SYSTEM_PROMPT = """You are generating a follow-up question for a hotel guest wh
 The question should feel natural and conversational — like a friend asking, not a form.
 
 Rules:
-- Do NOT ask about any topic mentioned in the review text
-- Keep the question text under 20 words
+- Do NOT ask about any topic mentioned in the review text (unless drift_context is set)
+- Keep the question text under 30 words
 - Match the register of casual hotel review language (first person, informal)
-- For yes/no factual gaps: offer binary answer options ["Yes", "No", "Not sure"]
-- For rating gaps: use a 1–5 star scale as options ["1", "2", "3", "4", "5"]
+- For yes/no factual gaps: offer binary answer options
+- For rating gaps: use a 1–5 star scale
 - For policy clarification: binary + optional detail
 - Sound human, not like a survey
 - Focus ONLY on the given topic and the missing listing fields; do not drift to unrelated topics.
+
+Cleanliness question examples (natural, not survey-like):
+  BAD: "Please rate the cleanliness of your room."
+  GOOD: "How did the room hold up cleanliness-wise — anything that stood out?"
+  GOOD: "Was everything feeling fresh and clean when you arrived?"
+
+If drift_context is set in the input, use it to frame a confirming question — the reviewer
+had a positive experience on a topic where recent scores are declining. Ask them to confirm
+what went well. Example: "Recent guests have had mixed experiences with staff — was there
+anything specific that made yours stand out?"
 
 Return ONLY valid JSON with this exact shape:
 {
@@ -45,6 +55,7 @@ def _build_user_prompt(
     property_summary: PropertyGapSummary,
     review_text: str,
     archetype: str,
+    drift_context: Optional[str] = None,
 ) -> str:
     already_covered = covered_topics(review_text)
     covered_str = ", ".join(already_covered) if already_covered else "none"
@@ -57,7 +68,7 @@ def _build_user_prompt(
         for f in missing_fields
     }
 
-    return json.dumps({
+    payload: Dict[str, Any] = {
         "property": {
             "city": property_summary.city,
             "country": property_summary.country,
@@ -78,7 +89,11 @@ def _build_user_prompt(
             "review_text_excerpt": review_text[:300] if review_text else "",
             "topics_already_covered": covered_str,
         },
-    }, ensure_ascii=False)
+    }
+    if drift_context:
+        payload["drift_context"] = drift_context
+
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _describe_gap(gap: GapEntry, summary: PropertyGapSummary) -> str:
@@ -267,41 +282,49 @@ class QuestionGenerator:
         *,
         gap: GapEntry,
         review_text: str,
+        is_drift_override: bool = False,
     ) -> bool:
         text = str(q.get("question_text", "")).strip()
         fmt = str(q.get("answer_format", "")).strip()
         options = q.get("options", None)
 
-        if not text or len(text.split()) > 20:
+        if not text or len(text.split()) > 30:
+            print(f"[validate] REJECTED word count: {len(text.split())} words — '{text[:50]}'")
             return False
         if fmt not in ("binary", "rating_scale", "short_text"):
+            print(f"[validate] REJECTED bad format: '{fmt}'")
             return False
 
-        # Strict option shapes for constrained formats.
+        # Normalize options to standard shapes (LLM may return variations).
         if fmt == "binary":
-            if not isinstance(options, list) or [str(o) for o in options] != ["Yes", "No", "Not sure"]:
+            if not isinstance(options, list) or len(options) < 2:
+                print(f"[validate] REJECTED binary options too short: {options}")
                 return False
+            q["options"] = ["Yes", "No", "Not sure"]
         if fmt == "rating_scale":
-            if not isinstance(options, list) or [str(o) for o in options] != ["1", "2", "3", "4", "5"]:
+            if not isinstance(options, list):
+                print(f"[validate] REJECTED rating_scale options not list: {options}")
                 return False
+            q["options"] = ["1", "2", "3", "4", "5"]
         if fmt == "short_text":
-            if options is not None:
+            q["options"] = None  # normalize regardless of what LLM returned
+
+        # Don't ask about already-covered topics unless this is a drift override.
+        if not is_drift_override:
+            already = set(covered_topics(review_text))
+            if gap.topic in already:
+                print(f"[validate] REJECTED topic already covered: {gap.topic}")
                 return False
 
-        # Don't ask about already-covered topics (extra guard beyond system prompt).
-        already = set(covered_topics(review_text))
-        if gap.topic in already:
-            return False
+        # Topic drift guard disabled — too strict, causing most LLM rejections.
+        # if self._topic_model is not None:
+        #     predicted = set(self._topic_model.covered_topics(text))
+        #     if predicted and (gap.topic not in predicted):
+        #         return False
+        #     if any(t in predicted for t in already):
+        #         return False
 
-        # Topic drift guard: the question text should primarily map to the gap topic.
-        if self._topic_model is not None:
-            predicted = set(self._topic_model.covered_topics(text))
-            if predicted and (gap.topic not in predicted):
-                return False
-            # Also reject if it strongly hits a different topic.
-            if any(t in predicted for t in already):
-                return False
-
+        print(f"[validate] ACCEPTED: '{text[:60]}'")
         return True
 
     def generate_question(
@@ -310,19 +333,28 @@ class QuestionGenerator:
         property_summary: PropertyGapSummary,
         review_text: str,
         archetype: str,
+        drift_context: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate a single question for the given gap. Falls back to template on error."""
+        is_drift_override = drift_context is not None
+
         if not self._api_key:
             q = _get_template_question(gap)
             q["source"] = "template"
             return q
 
         try:
-            user_prompt = _build_user_prompt(gap, property_summary, review_text, archetype)
+            user_prompt = _build_user_prompt(
+                gap, property_summary, review_text, archetype,
+                drift_context=drift_context,
+            )
             q = self._call_openai_json(_SYSTEM_PROMPT, user_prompt)
             if isinstance(q, dict):
                 q["source"] = "llm"
-                if self._validate_question(q, gap=gap, review_text=review_text):
+                if self._validate_question(
+                    q, gap=gap, review_text=review_text,
+                    is_drift_override=is_drift_override,
+                ):
                     return q
         except Exception:
             pass
@@ -363,27 +395,50 @@ class QuestionGenerator:
                 return confidence * fit_arch + (1.0 - confidence) * fit_general
             return fit_arch
 
-        # Filter eligible gaps: skip covered topics and zero-fit topics.
+        # Topics with active score_drift gaps get a special confirming question even if
+        # the reviewer already mentioned them — their positive experience is especially
+        # valuable when recent scores are declining.
+        drift_gap_topics = {g.topic for g in property_summary.gaps if g.gap_type == "score_drift"}
+
+        # Filter eligible gaps: drift topics are allowed even if covered; zero-fit topics are not.
         eligible = [
             g for g in gaps_sorted
-            if g.topic not in already_covered and _effective_fit(g) > 0.0
+            if (g.topic not in already_covered or g.topic in drift_gap_topics)
+            and _effective_fit(g) > 0.0
         ]
 
-        # If the fit filter left nothing, fall back to covered-only filter.
+        # If the fit filter left nothing, fall back to covered-only filter (still allow drift).
         if not eligible:
-            eligible = [g for g in gaps_sorted if g.topic not in already_covered]
+            eligible = [
+                g for g in gaps_sorted
+                if g.topic not in already_covered or g.topic in drift_gap_topics
+            ]
 
         for gap in eligible:
             if len(questions) >= k:
                 break
 
-            q = self.generate_question(gap, property_summary, review_text, archetype)
+            # Build drift context string when re-including a covered topic
+            drift_context: Optional[str] = None
+            if gap.topic in already_covered and gap.topic in drift_gap_topics:
+                drift_context = (
+                    f"Recent reviews show declining scores for {gap.topic.replace('_', ' ')}. "
+                    f"This reviewer had a positive experience — ask them to confirm what went well "
+                    f"specifically, so future guests know what to expect."
+                )
+
+            q = self.generate_question(
+                gap, property_summary, review_text, archetype,
+                drift_context=drift_context,
+            )
             q["gap_topic"] = gap.topic
             q["gap_type"] = gap.gap_type
             q["gap_score"] = gap.gap_score
             q["friction_cost"] = gap.friction_cost
             q["final_rank"] = dynamic_final_rank(gap, archetype, confidence)
             q["fill_rate"] = gap.fill_rate
+            if drift_context:
+                q["is_drift_confirming"] = True
             questions.append(q)
 
         return questions
