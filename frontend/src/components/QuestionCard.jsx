@@ -5,6 +5,8 @@ const STAR_VALS = ["1", "2", "3", "4", "5"];
 
 export default function QuestionCard({ question, onAnswer, onSkip }) {
   const [selectedOption, setSelectedOption] = useState(null);
+  /** Optional elaboration for star ratings (LLM often asks open-ended follow-ups in the same sentence). */
+  const [ratingDetail, setRatingDetail] = useState("");
   const [freeText, setFreeText] = useState("");
   const [listening, setListening] = useState(false);
   const [transcript, setTranscript] = useState("");
@@ -13,6 +15,7 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
 
   useEffect(() => {
     setSelectedOption(null);
+    setRatingDetail("");
     setFreeText("");
     setTranscript("");
     setListening(false);
@@ -61,7 +64,11 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
 
   function handleSubmit() {
     if (isClosed && selectedOption) {
-      onAnswer(selectedOption);
+      if (isRating && ratingDetail.trim()) {
+        onAnswer(`${selectedOption}/5 — ${ratingDetail.trim()}`);
+      } else {
+        onAnswer(selectedOption);
+      }
     } else if ((isShortText || useText) && freeText.trim()) {
       onAnswer(freeText.trim());
     }
@@ -86,20 +93,39 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
       {isClosed && question.options && (
         <div className={isRating ? "star-options" : "option-buttons"}>
           {isRating ? (
-            <div className="rating-row">
-              {STAR_VALS.map((v) => (
-                <button
-                  key={v}
-                  className={`star-opt ${selectedOption && parseInt(v) <= parseInt(selectedOption) ? "selected" : ""}`}
-                  onClick={() => setSelectedOption(v)}
-                  aria-label={`${v} star`}
-                >
-                  ★
-                </button>
-              ))}
-              {selectedOption && (
-                <span className="rating-label">{selectedOption} / 5</span>
-              )}
+            <div className="rating-block">
+              <div className="rating-row">
+                {STAR_VALS.map((v) => (
+                  <button
+                    key={v}
+                    type="button"
+                    className={`star-opt ${selectedOption && parseInt(v) <= parseInt(selectedOption) ? "selected" : ""}`}
+                    onClick={() => setSelectedOption(v)}
+                    aria-label={`${v} star`}
+                  >
+                    ★
+                  </button>
+                ))}
+                {selectedOption && (
+                  <span className="rating-label">{selectedOption} / 5</span>
+                )}
+              </div>
+              <label className="rating-detail-label" htmlFor="rating-detail">
+                Add a few words (optional)
+              </label>
+              <textarea
+                id="rating-detail"
+                className="rating-detail-input"
+                rows={3}
+                maxLength={500}
+                placeholder="e.g. what stood out, or anything future guests should know…"
+                value={ratingDetail}
+                onChange={(e) => setRatingDetail(e.target.value)}
+                aria-describedby="rating-detail-hint"
+              />
+              <p id="rating-detail-hint" className="rating-detail-hint">
+                Stars are enough to submit; add detail here when the question asks for it.
+              </p>
             </div>
           ) : (
             question.options.map((opt) => (

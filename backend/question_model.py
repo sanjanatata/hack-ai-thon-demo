@@ -344,7 +344,7 @@ class RankedCategory:
     missingness: float
     staleness: float
     frequency: float
-    credibility: float
+    corpus_missingness: float  # 1 − fraction of property reviews mentioning this category
     last_mention_days_ago: Optional[int]
 
 
@@ -352,8 +352,9 @@ class ReviewQuestionModel:
     """
     Backend-only logic to choose 1–2 follow-up questions for a review-in-progress.
 
-    "Training" here means computing simple corpus statistics (topic frequency across all reviews)
-    and property-level topic recency (last mention date per property+topic).
+    "Training" here means computing simple corpus statistics (topic frequency across all reviews),
+    property-level topic recency (last mention date per property+topic), and per-property
+    fraction of reviews that mention each category (for corpus missingness).
     """
 
     def __init__(self, description_df: pd.DataFrame, reviews_df: pd.DataFrame):
@@ -372,6 +373,7 @@ class ReviewQuestionModel:
 
         self._topic_frequency: Dict[Category, float] = {c: 0.0 for c in KEYWORDS}
         self._last_mention_by_property: Dict[Tuple[str, Category], Optional[date]] = {}
+        self._corpus_mention_rate: Dict[Tuple[str, Category], float] = {}
 
     @staticmethod
     def load_from_normalized(
@@ -423,6 +425,22 @@ class ReviewQuestionModel:
                         last[k] = d
 
         self._last_mention_by_property = {k: v for k, v in last.items()}
+
+        self._corpus_mention_rate = {}
+        for pid in self.reviews_df["eg_property_id"].astype(str).unique():
+            prop = self.reviews_df[self.reviews_df["eg_property_id"].astype(str) == pid]
+            n = len(prop)
+            for c in KEYWORDS:
+                if n == 0:
+                    self._corpus_mention_rate[(str(pid), c)] = 0.0
+                else:
+                    mentioned = 0
+                    for _, row in prop.iterrows():
+                        text = f"{row.get('review_title', '')} {row.get('review_text', '')}"
+                        if _has_any(text, KEYWORDS[c]):
+                            mentioned += 1
+                    self._corpus_mention_rate[(str(pid), c)] = mentioned / n
+
         self._trained = True
 
     def _missingness_for_property(self, pid: str, category: Category) -> float:
@@ -452,19 +470,6 @@ class ReviewQuestionModel:
         # ~0.2 at 30 days, ~0.5 at 120 days, ~0.8 at 300 days
         staleness = 1 - math.exp(-days / 180)
         return float(staleness), days
-
-    def _credibility(self, review_text: str, category: Category) -> float:
-        """
-        Can this reviewer credibly answer it?
-        Heuristic: do they mention the topic? is the review substantive?
-        """
-        text = (review_text or "").strip()
-        if not text:
-            return 0.1
-        length = len(_tokenize(text))
-        length_score = min(1.0, length / 60)  # saturate
-        mention_score = 1.0 if _has_any(text, KEYWORDS[category]) else 0.4
-        return 0.15 + 0.55 * mention_score + 0.30 * length_score
 
     def _has_negative_context(self, text: str, match_start: int) -> bool:
         window = text[max(0, match_start - 30) : match_start + 30]
@@ -728,18 +733,19 @@ class ReviewQuestionModel:
             missingness = self._missingness_for_property(pid, c)
             staleness, days_ago = self._staleness_for_property(pid, c, today_d)
             frequency = self._topic_frequency.get(c, 0.0)
-            credibility = self._credibility(review_text, c)
+            mention_rate = self._corpus_mention_rate.get((pid, c), 0.0)
+            corpus_missingness = max(0.0, min(1.0, 1.0 - mention_rate))
 
             # Weighted score (tunable):
             # - missingness: direct "unknown"
             # - staleness: outdated risk
             # - frequency: future guests will ask
-            # - credibility: this reviewer can answer now
+            # - corpus_missingness: property-level gap in review text for this category
             score = (
                 0.35 * missingness
                 + 0.30 * staleness
                 + 0.20 * frequency
-                + 0.15 * credibility
+                + 0.15 * corpus_missingness
             )
 
             ranked.append(
@@ -749,7 +755,7 @@ class ReviewQuestionModel:
                     missingness=float(missingness),
                     staleness=float(staleness),
                     frequency=float(frequency),
-                    credibility=float(credibility),
+                    corpus_missingness=float(corpus_missingness),
                     last_mention_days_ago=days_ago,
                 )
             )
@@ -838,7 +844,7 @@ class ReviewQuestionModel:
                     "missingness": r.missingness,
                     "staleness": r.staleness,
                     "frequency": r.frequency,
-                    "credibility": r.credibility,
+                    "corpus_missingness": r.corpus_missingness,
                     "last_mention_days_ago": r.last_mention_days_ago,
                 }
                 for r in ranked

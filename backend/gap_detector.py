@@ -1,6 +1,7 @@
 """
 Gap Detector — computes coverage gaps, staleness signals, and policy contradictions
-for each property, then ranks them by (staleness × 0.4 + future_guest_demand × 0.4 + reviewer_fit × 0.2).
+for each property, then ranks gaps using listing text, structured fill rates, and
+per-topic review-corpus text coverage (fraction of reviews mentioning each topic).
 """
 from __future__ import annotations
 
@@ -331,6 +332,7 @@ class GapEntry:
     fill_rate: Optional[float] = None
     listing_missingness: Optional[float] = None
     missing_description_fields: List[str] = field(default_factory=list)
+    text_missingness: Optional[float] = None  # 1 - mention_rate across property reviews
     status: str = "queued"  # "asked" | "queued"
 
 
@@ -345,6 +347,8 @@ class PropertyGapSummary:
     total_reviews: int
     avg_rating: float
     gaps: List[GapEntry]
+    # Fraction of reviews (per topic) whose text matches TOPIC_KEYWORDS for that topic.
+    topic_text_coverage: Dict[str, float] = field(default_factory=dict)
     # A small subset of listing fields used to ground follow-up questions.
     # This is NOT the full listing; it's limited to the fields we score gaps on.
     listing_fields: Dict[str, str] = field(default_factory=dict)
@@ -591,6 +595,9 @@ class GapDetector:
         # Topic coverage: last mention date per topic
         topic_last_mention = self._compute_topic_recency(prop_reviews)
 
+        # Per-topic fraction of reviews whose text mentions the topic (property-level corpus signal)
+        topic_text_coverage = self._compute_topic_text_coverage(prop_reviews)
+
         # Pet contradiction
         pet_contradiction = self._detect_pet_contradiction(
             pet_policy_raw, prop_reviews
@@ -607,6 +614,7 @@ class GapDetector:
             pid=pid,
             fill_rates=fill_rates,
             topic_last_mention=topic_last_mention,
+            topic_text_coverage=topic_text_coverage,
             pet_contradiction=pet_contradiction,
             score_drift_topics=score_drift_topics,
             renovation_detected=renovation_detected,
@@ -630,6 +638,7 @@ class GapDetector:
             total_reviews=len(prop_reviews),
             avg_rating=round(avg_rating, 2),
             gaps=gaps,
+            topic_text_coverage=topic_text_coverage,
             listing_fields=listing_fields,
         )
 
@@ -681,6 +690,27 @@ class GapDetector:
                     if last[topic] is None or d > last[topic]:
                         last[topic] = d
         return last
+
+    def _compute_topic_text_coverage(self, prop_reviews: pd.DataFrame) -> Dict[str, float]:
+        """
+        For each topic, fraction of reviews whose title+text matches TOPIC_KEYWORDS.
+        Empty corpus yields 0.0 for all topics (max text missingness when ranking).
+        """
+        n = len(prop_reviews)
+        out: Dict[str, float] = {t: 0.0 for t in TOPIC_CATEGORIES}
+        if n == 0:
+            return out
+        mentioned_per_topic = {t: 0 for t in TOPIC_CATEGORIES}
+        for _, row in prop_reviews.iterrows():
+            text = f"{row.get('review_title', '')} {row.get('review_text', '')}".strip()
+            if not text:
+                continue
+            for topic in TOPIC_CATEGORIES:
+                if _has_any(text, TOPIC_KEYWORDS[topic]):
+                    mentioned_per_topic[topic] += 1
+        for t in TOPIC_CATEGORIES:
+            out[t] = mentioned_per_topic[t] / n
+        return out
 
     def _detect_pet_contradiction(
         self, pet_policy_raw: str, prop_reviews: pd.DataFrame
@@ -753,6 +783,7 @@ class GapDetector:
         pid: str,
         fill_rates: Dict[str, float],
         topic_last_mention: Dict[str, Optional[date]],
+        topic_text_coverage: Dict[str, float],
         pet_contradiction: Tuple[bool, float],
         score_drift_topics: List[str],
         renovation_detected: bool,
@@ -766,20 +797,26 @@ class GapDetector:
             staleness: float,
             reviewer_fit: float,
             listing_missingness: float,
-        ) -> float:
+        ) -> Tuple[float, float]:
             """
             gap_score = base_score × TOPIC_DEMAND[topic]
+
+            base blends staleness, reviewer_fit, listing_missingness, and
+            text_missingness (1 − fraction of reviews mentioning the topic).
 
             Multiplying by demand means the same staleness/fill situation scores
             higher for topics future guests actually search for (service=0.35)
             than low-demand topics (affordability=0.06).
             """
+            mention_rate = float(topic_text_coverage.get(topic, 0.0))
+            text_missingness = max(0.0, min(1.0, 1.0 - mention_rate))
             base = (
-                0.50 * float(staleness)
-                + 0.30 * float(reviewer_fit)
+                0.40 * float(staleness)
+                + 0.25 * float(reviewer_fit)
                 + 0.20 * float(listing_missingness)
+                + 0.15 * float(text_missingness)
             )
-            return base * TOPIC_DEMAND.get(topic, 0.1)
+            return base * TOPIC_DEMAND.get(topic, 0.1), text_missingness
 
         # --- Pet contradiction (highest priority if Monterey-like) ---
         pet_contradict, pet_pct = pet_contradiction
@@ -790,7 +827,7 @@ class GapDetector:
             demand = FUTURE_GUEST_DEMAND["pets"]
             reviewer_fit = 0.6
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, "pets")
-            gap_score = _gap_score(
+            gap_score, tc_miss = _gap_score(
                 topic="pets",
                 staleness=staleness,
                 reviewer_fit=reviewer_fit,
@@ -811,6 +848,7 @@ class GapDetector:
                 fill_rate=pet_pct,
                 listing_missingness=round(listing_miss, 3),
                 missing_description_fields=missing_fields,
+                text_missingness=round(tc_miss, 3),
                 status="queued",
             ))
 
@@ -837,7 +875,7 @@ class GapDetector:
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.5
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
-            gap_score = _gap_score(
+            gap_score, tc_miss = _gap_score(
                 topic=topic,
                 staleness=staleness,
                 reviewer_fit=reviewer_fit,
@@ -859,6 +897,7 @@ class GapDetector:
                 fill_rate=fr,
                 listing_missingness=round(listing_miss, 3),
                 missing_description_fields=missing_fields,
+                text_missingness=round(tc_miss, 3),
                 status="queued",
             ))
 
@@ -883,7 +922,7 @@ class GapDetector:
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.5
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
-            gap_score = _gap_score(
+            gap_score, tc_miss = _gap_score(
                 topic=topic,
                 staleness=staleness,
                 reviewer_fit=reviewer_fit,
@@ -904,6 +943,7 @@ class GapDetector:
                 fill_rate=round(actual_fill, 3),
                 listing_missingness=round(listing_miss, 3),
                 missing_description_fields=missing_fields,
+                text_missingness=round(tc_miss, 3),
                 status="queued",
             ))
 
@@ -925,7 +965,7 @@ class GapDetector:
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.3)
             reviewer_fit = 0.7
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
-            gap_score = _gap_score(
+            gap_score, tc_miss = _gap_score(
                 topic=topic,
                 staleness=staleness,
                 reviewer_fit=reviewer_fit,
@@ -945,6 +985,7 @@ class GapDetector:
                 last_mention_days_ago=days_ago,
                 listing_missingness=round(listing_miss, 3),
                 missing_description_fields=missing_fields,
+                text_missingness=round(tc_miss, 3),
                 status="queued",
             ))
 
@@ -962,7 +1003,7 @@ class GapDetector:
             staleness = 0.2 if last else 0.4
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.5
-            gap_score = _gap_score(
+            gap_score, tc_miss = _gap_score(
                 topic=topic,
                 staleness=staleness,
                 reviewer_fit=reviewer_fit,
@@ -984,6 +1025,7 @@ class GapDetector:
                     fill_rate=None,
                     listing_missingness=round(listing_miss, 3),
                     missing_description_fields=missing_fields,
+                    text_missingness=round(tc_miss, 3),
                     status="queued",
                 )
             )
@@ -1011,7 +1053,7 @@ class GapDetector:
             demand = FUTURE_GUEST_DEMAND.get(topic, 0.1)
             reviewer_fit = 0.4
             listing_miss, missing_fields = self._listing_missingness_for_topic(pid, topic)
-            gap_score = _gap_score(
+            gap_score, tc_miss = _gap_score(
                 topic=topic,
                 staleness=staleness,
                 reviewer_fit=reviewer_fit,
@@ -1033,6 +1075,7 @@ class GapDetector:
                 last_mention_days_ago=days_ago,
                 listing_missingness=round(listing_miss, 3),
                 missing_description_fields=missing_fields,
+                text_missingness=round(tc_miss, 3),
                 status="queued",
             ))
 

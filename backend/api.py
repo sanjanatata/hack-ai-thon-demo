@@ -143,6 +143,7 @@ def get_property(property_id: str):
             "fill_rate": g.fill_rate,
             "listing_missingness": getattr(g, "listing_missingness", None),
             "missing_description_fields": getattr(g, "missing_description_fields", []),
+            "text_missingness": getattr(g, "text_missingness", None),
             "status": g.status,
         })
 
@@ -155,6 +156,7 @@ def get_property(property_id: str):
         "popular_amenities": summary.popular_amenities,
         "total_reviews": summary.total_reviews,
         "avg_rating": summary.avg_rating,
+        "topic_text_coverage": getattr(summary, "topic_text_coverage", {}),
         "gaps": gaps_out,
     }
 
@@ -209,6 +211,7 @@ def generate_questions(property_id: str, body: QuestionRequest):
             "skipped": gap.topic in already_covered,
             "listing_missingness": getattr(gap, "listing_missingness", None),
             "missing_description_fields": getattr(gap, "missing_description_fields", []),
+            "text_missingness": getattr(gap, "text_missingness", None),
         })
 
     return {
@@ -221,6 +224,7 @@ def generate_questions(property_id: str, body: QuestionRequest):
             "city": summary.city,
             "star_rating": summary.star_rating,
             "pet_policy": summary.pet_policy,
+            "topic_text_coverage": getattr(summary, "topic_text_coverage", {}),
         },
     }
 
