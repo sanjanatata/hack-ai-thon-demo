@@ -2,7 +2,6 @@
 FastAPI backend for the Smart Review Gap-Filler prototype.
 """
 
-
 from __future__ import annotations
 
 import os
@@ -12,7 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 print(f"[startup] OPENAI_API_KEY loaded: {bool(os.getenv('OPENAI_API_KEY'))}")
 
 from fastapi import FastAPI, HTTPException
