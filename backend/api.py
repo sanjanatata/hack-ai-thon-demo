@@ -22,13 +22,13 @@ from pydantic import BaseModel
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
-from backend.gap_detector import (
+from gap_detector import (
     GapDetector,
     build_impact_data,
     covered_topics,
     infer_archetype,
 )
-from backend.llm_questions import QuestionGenerator
+from llm_questions import QuestionGenerator
 
 # ---------------------------------------------------------------------------
 # App setup
