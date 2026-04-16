@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 import re
+import uuid
+import json
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,9 +16,11 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 print(f"[startup] OPENAI_API_KEY loaded: {bool(os.getenv('OPENAI_API_KEY'))}")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from backend.gap_detector import (
     GapDetector,
@@ -110,6 +114,92 @@ class AnswerSubmission(BaseModel):
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+
+def _multipart_formdata(fields: Dict[str, str], files: Dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
+    """
+    Build a multipart/form-data body.
+    files: { fieldname: (filename, content_bytes, content_type) }
+    Returns: (body, content_type_header_value)
+    """
+    boundary = f"----WebKitFormBoundary{uuid.uuid4().hex}"
+    crlf = "\r\n"
+    parts: List[bytes] = []
+
+    for name, value in fields.items():
+        parts.append(f"--{boundary}{crlf}".encode())
+        parts.append(f'Content-Disposition: form-data; name="{name}"{crlf}{crlf}'.encode())
+        parts.append(str(value).encode("utf-8"))
+        parts.append(crlf.encode())
+
+    for name, (filename, content, ctype) in files.items():
+        parts.append(f"--{boundary}{crlf}".encode())
+        parts.append(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"{crlf}'.encode()
+        )
+        parts.append(f"Content-Type: {ctype}{crlf}{crlf}".encode())
+        parts.append(content)
+        parts.append(crlf.encode())
+
+    parts.append(f"--{boundary}--{crlf}".encode())
+    body = b"".join(parts)
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(default=None),
+):
+    """
+    Transcribe an audio blob using OpenAI Speech-to-Text.
+    Frontend sends: multipart/form-data with "file".
+    Returns: { "text": "..." }
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set")
+
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+
+    audio = await file.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="Empty audio file")
+
+    fields = {"model": model}
+    if language:
+        fields["language"] = language
+
+    body, content_type = _multipart_formdata(
+        fields=fields,
+        files={"file": (file.filename or "audio.webm", audio, file.content_type or "application/octet-stream")},
+    )
+
+    req = urllib_request.Request(
+        f"{base_url}/audio/transcriptions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": content_type,
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            out = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(out)
+            text = data.get("text", "")
+            return {"text": text}
+    except urllib_error.HTTPError as e:
+        snippet = ""
+        try:
+            snippet = e.read(400).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=f"OpenAI STT error: HTTP {e.code} {snippet[:200]}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI STT error: {type(e).__name__}: {e}")
 
 
 @app.get("/api/properties")

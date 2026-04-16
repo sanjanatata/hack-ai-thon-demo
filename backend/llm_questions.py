@@ -37,9 +37,12 @@ Intent framing:
 
 Hard rules:
   - Ask ONLY about task.target_topic
-  - Never repeat topics already listed in reviewer_context.topics_already_covered
+  - If task.allow_repeat_topic is false: never repeat topics already listed in reviewer_context.topics_already_covered
+  - If task.allow_repeat_topic is true: you MAY ask a deeper follow-up on the same topic, but do not restate their complaint verbatim
   - Under 30 words
   - Conversational, not survey-like — sound like a friend, not a form
+
+If task.empathy is true, start with a brief human acknowledgement (e.g. "I'm sorry that happened") then ask your question.
 
 Cleanliness examples (use this style for all topics):
   BAD:  "Please rate the cleanliness of your room."
@@ -65,6 +68,8 @@ def _build_user_prompt(
     drift_context: Optional[str] = None,
     intent: str = "listing_gap",
     sentiment_map: Optional[Dict[str, str]] = None,
+    allow_repeat_topic: bool = False,
+    empathy: bool = False,
 ) -> str:
     already_covered = covered_topics(review_text)
     covered_str = ", ".join(already_covered) if already_covered else "none"
@@ -94,6 +99,8 @@ def _build_user_prompt(
         "intent": intent,
         "framing_hint": _make_framing_hint(gap, intent, already_covered, sentiment_map or {}),
         "answer_format": gap.question_format,
+        "allow_repeat_topic": bool(allow_repeat_topic),
+        "empathy": bool(empathy),
     }
 
     payload: Dict[str, Any] = {
@@ -442,6 +449,7 @@ class QuestionGenerator:
         gap: GapEntry,
         review_text: str,
         is_drift_override: bool = False,
+        allow_repeat_topic: bool = False,
     ) -> bool:
         text = str(q.get("question_text", "")).strip()
         fmt = str(q.get("answer_format", "")).strip()
@@ -468,8 +476,9 @@ class QuestionGenerator:
         if fmt == "short_text":
             q["options"] = None  # normalize regardless of what LLM returned
 
-        # Don't ask about already-covered topics unless this is a drift override.
-        if not is_drift_override:
+        # Don't ask about already-covered topics unless this is a drift override
+        # or we explicitly allow a deeper follow-up on a negative mention.
+        if not is_drift_override and not allow_repeat_topic:
             already = set(covered_topics(review_text))
             if gap.topic in already:
                 print(f"[validate] REJECTED topic already covered: {gap.topic}")
@@ -495,6 +504,8 @@ class QuestionGenerator:
         drift_context: Optional[str] = None,
         intent: str = "listing_gap",
         sentiment_map: Optional[Dict[str, str]] = None,
+        allow_repeat_topic: bool = False,
+        empathy: bool = False,
     ) -> Dict[str, Any]:
         """Generate a single question for the given gap. Falls back to template on error."""
         is_drift_override = drift_context is not None
@@ -511,6 +522,8 @@ class QuestionGenerator:
                 drift_context=drift_context,
                 intent=intent,
                 sentiment_map=sentiment_map,
+                allow_repeat_topic=allow_repeat_topic,
+                empathy=empathy,
             )
             q = self._call_openai_json(_SYSTEM_PROMPT, user_prompt)
             if q is None:
@@ -520,6 +533,7 @@ class QuestionGenerator:
                 if self._validate_question(
                     q, gap=gap, review_text=review_text,
                     is_drift_override=is_drift_override,
+                    allow_repeat_topic=allow_repeat_topic,
                 ):
                     print(f"[llm] ✓ Accepted LLM question for {gap.topic!r}")
                     return q
@@ -540,20 +554,14 @@ class QuestionGenerator:
         confidence: float = 1.0,
         k: int = 2,
     ) -> List[Dict[str, Any]]:
-        """Two-slot question generation strategy.
+        """Two-slot strategy:
 
-        Slot Q1 (intent="review_follow_up"):
-            Grounded in the reviewer's own narrative. Picks the gap most adjacent
-            to what they described via PIVOT_TABLE (covered topic × sentiment →
-            preferred next topics). Never repeats a covered topic.
+        - Q1 (review_follow_up): ALWAYS expands on what the user wrote in the review.
+          We pick the most salient mentioned topic (prefer negative mentions), then
+          force an LLM follow-up on that same topic (allow_repeat_topic=True).
 
-        Slot Q2 (intent="listing_gap"):
-            Systematic data fill for missing/stale listing information. Picks
-            the gap with the highest listing_gap_score (listing_missing type,
-            high field missingness, staleness). Must be a different topic from Q1.
-
-        Drift override: if a covered topic has an active score_drift gap, it may
-        appear in Q1 as a confirming question (positive experience on a declining topic).
+        - Q2 (listing_gap): Systematic gap-filler for future travelers, ranked by listing_gap_score,
+          and must be a different topic from Q1 when possible.
         """
         already_covered = set(covered_topics(review_text))
         sentiment_map = extract_review_sentiment(review_text)
@@ -570,55 +578,53 @@ class QuestionGenerator:
 
         drift_gap_topics = {g.topic for g in property_summary.gaps if g.gap_type == "score_drift"}
 
-        # Eligible pool: not covered + non-zero fit (drift topics allowed for Q1 confirming)
-        def _pool(allow_covered_drift: bool) -> List[GapEntry]:
+        # Eligible pool for Q2: not covered + non-zero fit
+        def _pool() -> List[GapEntry]:
             return [
                 g for g in property_summary.gaps
-                if (g.topic not in already_covered
-                    or (allow_covered_drift and g.topic in drift_gap_topics))
-                and _effective_fit(g) > 0.0
+                if (g.topic not in already_covered) and _effective_fit(g) > 0.0
             ]
 
-        # ── Q1: review-grounded pivot ─────────────────────────────────────────
-        is_short_review = len((review_text or "").split()) < SHORT_REVIEW_THRESHOLD
+        # ── Q1: ALWAYS expand on the review text ──────────────────────────────
+        # Pick a salient topic mentioned in the review; prefer negative mentions.
+        negative_topics = [t for t, s in (sentiment_map or {}).items() if s == "negative"]
+        positive_topics = [t for t, s in (sentiment_map or {}).items() if s == "positive"]
 
-        if is_short_review or not already_covered:
-            # No reliable pivot signal — use demand-weighted fallback ordering.
-            # FALLBACK_TOPIC_ORDER provides a stable, high-value ranking independent
-            # of review content so short reviews don't get random results.
-            q1_pool = sorted(
-                _pool(allow_covered_drift=False),
-                key=lambda g: (
-                    FALLBACK_TOPIC_ORDER.index(g.topic)
-                    if g.topic in FALLBACK_TOPIC_ORDER
-                    else len(FALLBACK_TOPIC_ORDER)
-                ),
-            )
-            print(f"[q1] short/empty review ({len((review_text or '').split())} words) — fallback order")
+        if negative_topics:
+            q1_topic = negative_topics[0]
+            q1_empathy = True
+        elif positive_topics:
+            q1_topic = positive_topics[0]
+            q1_empathy = False
+        elif already_covered:
+            q1_topic = sorted(list(already_covered))[0]
+            q1_empathy = False
         else:
-            # Rank by review_fit_score (pivot adjacency × demand). Covered topics score
-            # 0.0 in review_fit_score so they never win Q1.
-            q1_pool = sorted(
-                _pool(allow_covered_drift=False),
-                key=lambda g: review_fit_score(g, already_covered, sentiment_map),
-                reverse=True,
-            )
-            # If pivot scoring yields an empty pool, fall back to dynamic_final_rank.
-            if not q1_pool:
-                q1_pool = sorted(
-                    [g for g in property_summary.gaps
-                     if g.topic not in already_covered and _effective_fit(g) > 0.0],
-                    key=lambda g: dynamic_final_rank(g, archetype, confidence),
-                    reverse=True,
-                )
+            # If we truly can't detect a topic, ask a general elaboration under service_checkin framing.
+            q1_topic = "service_checkin"
+            q1_empathy = False
 
-        q1_gap = q1_pool[0] if q1_pool else None
-        q1_topic = q1_gap.topic if q1_gap else None
+        q1_gap: GapEntry = GapEntry(
+            topic=q1_topic,
+            gap_type="review_follow_up",
+            staleness_weight=0.0,
+            future_guest_demand=0.0,
+            reviewer_fit=1.0,
+            gap_score=0.0,
+            friction_cost=1,
+            final_rank=0.0,
+            question_format="short_text",
+            last_mention_days_ago=None,
+            fill_rate=None,
+            listing_missingness=None,
+            missing_description_fields=[],
+            status="queued",
+        )
 
         # ── Q2: listing gap filler ────────────────────────────────────────────
         # Rank by listing_gap_score. Must pick a different topic from Q1.
         q2_pool = sorted(
-            [g for g in _pool(allow_covered_drift=False) if g.topic != q1_topic],
+            [g for g in _pool() if g.topic != q1_topic],
             key=lambda g: listing_gap_score(g),
             reverse=True,
         )
@@ -627,7 +633,7 @@ class QuestionGenerator:
         # Last-resort: allow drift-covered topics for Q2 if nothing else is available
         if q2_gap is None:
             drift_fallback = sorted(
-                [g for g in _pool(allow_covered_drift=True) if g.topic != q1_topic],
+                [g for g in property_summary.gaps if g.topic != q1_topic and _effective_fit(g) > 0.0],
                 key=lambda g: listing_gap_score(g),
                 reverse=True,
             )
@@ -635,13 +641,12 @@ class QuestionGenerator:
 
         # ── Assemble and generate ─────────────────────────────────────────────
         slots: List[tuple] = []
-        if q1_gap:
-            slots.append((q1_gap, "review_follow_up"))
+        slots.append((q1_gap, "review_follow_up", True, q1_empathy))
         if q2_gap:
-            slots.append((q2_gap, "listing_gap"))
+            slots.append((q2_gap, "listing_gap", False, False))
 
         questions: List[Dict[str, Any]] = []
-        for gap, intent in slots[:k]:
+        for gap, intent, allow_repeat, empathy in slots[:k]:
             drift_ctx: Optional[str] = None
             if gap.topic in already_covered and gap.topic in drift_gap_topics:
                 drift_ctx = (
@@ -655,6 +660,8 @@ class QuestionGenerator:
                 drift_context=drift_ctx,
                 intent=intent,
                 sentiment_map=sentiment_map,
+                allow_repeat_topic=allow_repeat,
+                empathy=empathy,
             )
             q["gap_topic"] = gap.topic
             q["gap_type"] = gap.gap_type

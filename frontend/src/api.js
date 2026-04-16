@@ -35,3 +35,20 @@ export async function logSkip(data) {
     body: JSON.stringify(data),
   });
 }
+
+export async function transcribeAudio(blob, filename = "audio.webm") {
+  const fd = new FormData();
+  fd.append("file", blob, filename);
+  const r = await fetch(`${BASE}/transcribe`, { method: "POST", body: fd });
+  if (!r.ok) {
+    let detail = "";
+    try {
+      const j = await r.json();
+      detail = j?.detail ? `: ${j.detail}` : "";
+    } catch {
+      // ignore
+    }
+    throw new Error(`Transcription failed (${r.status})${detail}`);
+  }
+  return r.json();
+}

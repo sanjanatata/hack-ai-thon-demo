@@ -125,6 +125,9 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "location", "walk", "walkable", "near", "close", "train", "metro",
         "bus", "airport", "station", "parking", "safe", "neighborhood",
         "downtown", "wharf",
+        # Common phrasing not captured by the above:
+        "public transport", "public transportation", "transit", "public transit",
+        "subway", "tram", "rideshare", "ride share", "uber", "lyft",
     ],
     "accessibility": [
         "accessible", "wheelchair", "elevator", "stairs", "step", "ramp",
@@ -313,6 +316,33 @@ NEGATION_WORDS: frozenset = frozenset({
     "not", "never", "no", "wasn't", "weren't", "didn't", "don't",
     "couldn't", "wouldn't", "nothing", "nor", "hardly", "barely", "without",
 })
+
+# Phrase-level sentiment cues catch common constructions that token-only sets miss,
+# especially "didn't like X" which otherwise looks neutral.
+SENTIMENT_NEGATIVE_PHRASES: Tuple[str, ...] = (
+    "didn't like",
+    "did not like",
+    "don't like",
+    "dont like",
+    "not a fan",
+    "wasn't a fan",
+    "was not a fan",
+    "dislike",
+    "disliked",
+    "hate",
+    "hated",
+    "wouldn't recommend",
+    "would not recommend",
+    "not worth",
+)
+
+SENTIMENT_POSITIVE_PHRASES: Tuple[str, ...] = (
+    "highly recommend",
+    "would recommend",
+    "would stay again",
+    "would definitely stay again",
+    "loved it",
+)
 
 # Flat adjacency map — sentiment-agnostic.
 # Maps each topic to the best next topics to explore when that topic has been mentioned.
@@ -1261,22 +1291,33 @@ def extract_review_sentiment(review_text: str) -> Dict[str, str]:
 
     for sent in sentences:
         sent_lower = sent.lower().strip()
+        # Normalize common unicode apostrophes so phrase/negation matching works.
+        sent_lower = sent_lower.replace("’", "'").replace("‘", "'")
         if not sent_lower:
             continue
+        # Phrase-level overrides first (most reliable).
+        phrase_pos = any(p in sent_lower for p in SENTIMENT_POSITIVE_PHRASES)
+        phrase_neg = any(p in sent_lower for p in SENTIMENT_NEGATIVE_PHRASES)
+
         words = set(re.findall(r"\b\w+\b", sent_lower))
         has_negation = bool(words & NEGATION_WORDS)
         pos_hits = len(words & SENTIMENT_POSITIVE)
         neg_hits = len(words & SENTIMENT_NEGATIVE)
 
-        if pos_hits > neg_hits:
+        if phrase_pos and not phrase_neg:
+            raw = "positive"
+        elif phrase_neg and not phrase_pos:
+            raw = "negative"
+        elif pos_hits > neg_hits:
             raw = "positive"
         elif neg_hits > pos_hits:
             raw = "negative"
         else:
             raw = "neutral"
 
-        # Flip on negation: "not clean" → negative; "not dirty" → positive
-        if has_negation:
+        # Flip on negation only when we have a directional signal.
+        # e.g. "not clean" → negative; "not dirty" → positive; but don't flip pure neutral.
+        if has_negation and raw in ("positive", "negative"):
             raw = {"positive": "negative", "negative": "positive"}.get(raw, raw)
 
         for topic, kws in TOPIC_KEYWORDS.items():

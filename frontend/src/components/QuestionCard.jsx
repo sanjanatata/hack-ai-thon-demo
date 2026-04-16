@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import "./QuestionCard.css";
+import { transcribeAudio } from "../api";
 
 const STAR_VALS = ["1", "2", "3", "4", "5"];
 
@@ -12,6 +13,10 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
   const [transcript, setTranscript] = useState("");
   const [useText, setUseText] = useState(false);
   const recognitionRef = useRef(null);
+  const recorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const chunksRef = useRef([]);
+  const [transcribing, setTranscribing] = useState(false);
 
   useEffect(() => {
     setSelectedOption(null);
@@ -20,6 +25,7 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
     setTranscript("");
     setListening(false);
     setUseText(false);
+    setTranscribing(false);
   }, [question]);
 
   const isClosed =
@@ -27,38 +33,59 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
   const isRating = question.answer_format === "rating_scale";
   const isShortText = question.answer_format === "short_text";
 
-  // Voice input
-  function startListening() {
-    const SpeechRecognition =
-      window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      setUseText(true);
-      return;
-    }
-    const rec = new SpeechRecognition();
-    rec.continuous = false;
-    rec.interimResults = true;
-    rec.lang = "en-US";
-    recognitionRef.current = rec;
+  // Voice input (MediaRecorder -> backend OpenAI STT)
+  async function startListening() {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      chunksRef.current = [];
 
-    rec.onstart = () => setListening(true);
-    rec.onend = () => setListening(false);
-    rec.onresult = (e) => {
-      const t = Array.from(e.results)
-        .map((r) => r[0].transcript)
-        .join("");
-      setTranscript(t);
-      setFreeText(t);
-    };
-    rec.onerror = () => {
-      setListening(false);
+      const rec = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      recorderRef.current = rec;
+
+      rec.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+      rec.onstart = () => setListening(true);
+      rec.onstop = async () => {
+        setListening(false);
+        // stop tracks
+        try {
+          streamRef.current?.getTracks()?.forEach((t) => t.stop());
+        } catch {
+          // ignore
+        }
+        streamRef.current = null;
+
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        if (!blob.size) return;
+        setTranscribing(true);
+        try {
+          const { text } = await transcribeAudio(blob, "answer.webm");
+          const t = (text || "").trim();
+          setTranscript(t);
+          setFreeText(t);
+        } catch (e) {
+          console.error(e);
+          setUseText(true);
+        } finally {
+          setTranscribing(false);
+        }
+      };
+
+      rec.start();
+    } catch (e) {
+      console.error(e);
       setUseText(true);
-    };
-    rec.start();
+    }
   }
 
   function stopListening() {
-    recognitionRef.current?.stop();
+    try {
+      recorderRef.current?.stop();
+    } catch {
+      // ignore
+    }
     setListening(false);
   }
 
@@ -145,12 +172,12 @@ export default function QuestionCard({ question, onAnswer, onSkip }) {
       {isShortText && !useText && (
         <div className="voice-section">
           {!listening ? (
-            <button className="mic-btn" onClick={startListening}>
-              🎙 Speak your answer
+            <button className="mic-btn" onClick={startListening} disabled={transcribing}>
+              {transcribing ? "Transcribing…" : "Speak your answer"}
             </button>
           ) : (
             <button className="mic-btn listening" onClick={stopListening}>
-              ⏹ Stop recording
+              Stop recording
             </button>
           )}
           {transcript && (
