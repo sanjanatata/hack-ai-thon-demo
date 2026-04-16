@@ -7,7 +7,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://localhost:8007',
+        target: 'https://reviewbit.onrender.com',
         changeOrigin: true,
       },
     },
