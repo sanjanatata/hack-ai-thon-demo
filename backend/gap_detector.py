@@ -288,6 +288,96 @@ ARCHETYPE_TOPIC_FIT: Dict[str, Dict[str, float]] = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Sentiment analysis helpers
+# ---------------------------------------------------------------------------
+
+SENTIMENT_POSITIVE: frozenset = frozenset({
+    "great", "excellent", "amazing", "perfect", "loved", "wonderful", "fantastic",
+    "beautiful", "nice", "good", "helpful", "friendly", "smooth", "easy",
+    "convenient", "comfortable", "impressed", "outstanding", "superb", "lovely",
+    "spotless", "cozy", "immaculate", "pleased", "enjoyed", "recommend", "clean",
+    "spacious", "quiet", "relaxing", "delightful", "satisfied", "pleasant",
+    "exceptional", "fabulous", "best", "happy", "modern", "fresh",
+})
+
+SENTIMENT_NEGATIVE: frozenset = frozenset({
+    "bad", "terrible", "awful", "dirty", "rude", "broken", "slow", "noisy",
+    "disappointing", "poor", "messy", "stained", "smelly", "cramped",
+    "uncomfortable", "horrible", "worst", "disgusting", "outdated", "dated",
+    "unpleasant", "chaotic", "disorganized", "cold", "overpriced", "lacking",
+    "missing", "wrong", "issue", "issues", "problem", "problems",
+})
+
+NEGATION_WORDS: frozenset = frozenset({
+    "not", "never", "no", "wasn't", "weren't", "didn't", "don't",
+    "couldn't", "wouldn't", "nothing", "nor", "hardly", "barely", "without",
+})
+
+# Flat adjacency map — sentiment-agnostic.
+# Maps each topic to the best next topics to explore when that topic has been mentioned.
+# Used as a readable reference; PIVOT_TABLE below adds sentiment differentiation on top.
+#
+# Exclusion logic applied before using this map:
+#   Final_Candidates = All_Topics - Covered_Topics - Q1_Selected_Topic
+#
+PIVOT_MAP: Dict[str, List[str]] = {
+    "cleanliness":           ["service_checkin", "ambiance_decor"],    # messy/clean → staff or room condition
+    "ambiance_decor":        ["cleanliness", "service_checkin"],       # decor → cleanliness or staff response
+    "service_checkin":       ["amenities_food", "location_transportation"],  # staff → amenities or location
+    "location_transportation": ["amenities_food", "service_checkin"],  # location → what else to do / staff
+    "amenities_food":        ["ambiance_decor", "cleanliness"],        # food/pool → room quality and cleanliness
+    "affordability":         ["amenities_food", "service_checkin"],    # value → amenities or service worth it?
+    "pets":                  ["cleanliness", "amenities_food"],        # pet stay → cleanliness, pet-friendly areas
+    "accessibility":         ["service_checkin", "location_transportation"],  # accessibility → staff help, routes
+}
+
+# Pivot adjacency table: (topic_mentioned × sentiment) → preferred next topics for Q1.
+# Q1 picks the gap most naturally adjacent to what the reviewer already described,
+# without repeating it. The pivot keeps Q1 coherent with the review narrative.
+PIVOT_TABLE: Dict[str, Dict[str, List[str]]] = {
+    "ambiance_decor": {
+        "negative": ["cleanliness", "service_checkin"],     # messy/dated → probe adjacent signals
+        "positive": ["amenities_food", "location_transportation"],   # nice room → what else?
+        "neutral":  ["service_checkin", "cleanliness"],
+    },
+    "cleanliness": {
+        "negative": ["service_checkin", "ambiance_decor"],  # dirty → staff responsive?
+        "positive": ["ambiance_decor", "amenities_food"],   # spotless → room quality?
+        "neutral":  ["service_checkin"],
+    },
+    "service_checkin": {
+        "negative": ["cleanliness", "amenities_food"],      # bad staff → other friction?
+        "positive": ["amenities_food", "location_transportation"],   # great staff → what else?
+        "neutral":  ["cleanliness", "location_transportation"],
+    },
+    "location_transportation": {
+        "negative": ["amenities_food", "service_checkin"],  # bad location → what kept them?
+        "positive": ["amenities_food", "ambiance_decor"],   # great location → overall experience?
+        "neutral":  ["service_checkin", "amenities_food"],
+    },
+    "amenities_food": {
+        "negative": ["affordability", "service_checkin"],   # bad amenities → worth the price?
+        "positive": ["ambiance_decor", "cleanliness"],      # loved amenities → room quality?
+        "neutral":  ["service_checkin"],
+    },
+    "affordability": {
+        "negative": ["amenities_food", "service_checkin"],  # overpriced → what did they get?
+        "positive": ["ambiance_decor", "amenities_food"],   # great value → what stood out?
+        "neutral":  ["service_checkin", "cleanliness"],
+    },
+    "pets": {
+        "positive": ["cleanliness", "amenities_food"],      # dog-friendly → was it actually clean?
+        "negative": ["service_checkin"],                    # pet issues → staff response?
+        "neutral":  ["cleanliness", "service_checkin"],
+    },
+    "accessibility": {
+        "positive": ["service_checkin", "location_transportation"],
+        "negative": ["service_checkin"],
+        "neutral":  ["service_checkin"],
+    },
+}
+
 
 def dynamic_final_rank(gap: "GapEntry", archetype: str, confidence: float = 1.0) -> float:
     """
@@ -1154,6 +1244,93 @@ def covered_topics(review_text: str) -> List[str]:
         if _has_any(review_text, kws):
             covered.append(topic)
     return covered
+
+
+# ---------------------------------------------------------------------------
+# Review sentiment extraction and two-slot scoring
+# ---------------------------------------------------------------------------
+
+def extract_review_sentiment(review_text: str) -> Dict[str, str]:
+    """Lightweight per-topic sentiment using keyword + sentence-level negation heuristics.
+
+    Returns Dict[topic, "positive" | "negative" | "neutral"] for topics mentioned.
+    Non-English text will produce empty dict (sentiment words won't match) — graceful no-op.
+    """
+    sentences = re.split(r"[.!?;]+", review_text or "")
+    topic_votes: Dict[str, List[str]] = {t: [] for t in TOPIC_KEYWORDS}
+
+    for sent in sentences:
+        sent_lower = sent.lower().strip()
+        if not sent_lower:
+            continue
+        words = set(re.findall(r"\b\w+\b", sent_lower))
+        has_negation = bool(words & NEGATION_WORDS)
+        pos_hits = len(words & SENTIMENT_POSITIVE)
+        neg_hits = len(words & SENTIMENT_NEGATIVE)
+
+        if pos_hits > neg_hits:
+            raw = "positive"
+        elif neg_hits > pos_hits:
+            raw = "negative"
+        else:
+            raw = "neutral"
+
+        # Flip on negation: "not clean" → negative; "not dirty" → positive
+        if has_negation:
+            raw = {"positive": "negative", "negative": "positive"}.get(raw, raw)
+
+        for topic, kws in TOPIC_KEYWORDS.items():
+            if _has_any(sent_lower, kws):
+                topic_votes[topic].append(raw)
+
+    result: Dict[str, str] = {}
+    for topic, votes in topic_votes.items():
+        if not votes:
+            continue
+        pos = votes.count("positive")
+        neg = votes.count("negative")
+        result[topic] = "positive" if pos > neg else ("negative" if neg > pos else "neutral")
+    return result
+
+
+def review_fit_score(
+    gap: "GapEntry",
+    already_covered: set,
+    sentiment_map: Dict[str, str],
+) -> float:
+    """Q1 slot scoring: rewards gaps adjacent to what the reviewer described.
+
+    Uses PIVOT_TABLE to boost topics that naturally follow from the reviewer's
+    narrative (covered topic × sentiment → preferred next topics). Returns 0.0
+    for already-covered topics — Q1 should never repeat them.
+    """
+    if gap.topic in already_covered:
+        return 0.0
+    pivot_boost = 0.0
+    for covered_topic in already_covered:
+        sent = sentiment_map.get(covered_topic, "neutral")
+        adjacent = PIVOT_TABLE.get(covered_topic, {}).get(sent, [])
+        if gap.topic in adjacent:
+            pivot_boost += 1.0
+    demand = TOPIC_DEMAND.get(gap.topic, 0.1)
+    return (gap.gap_score + pivot_boost * 0.3) * demand
+
+
+def listing_gap_score(gap: "GapEntry") -> float:
+    """Q2 slot scoring: fills the most urgent missing or stale listing data first.
+
+    Staleness and missingness are scored independently with different weights:
+      - staleness_weight (0.45): stale data actively misleads future guests — highest urgency
+      - listing_missingness (0.35): null fields leave guests uninformed — high urgency
+      - gap_score (0.20): base quality signal (demand × fill situation) — tiebreaker
+
+    listing_missing gap type gets 1.5× boost because it combines both signals.
+    """
+    type_boost = 1.5 if gap.gap_type == "listing_missing" else 1.0
+    staleness = float(getattr(gap, "staleness_weight", 0.0) or 0.0)
+    missingness = float(getattr(gap, "listing_missingness", 0.0) or 0.0)
+    demand = TOPIC_DEMAND.get(gap.topic, 0.1)
+    return (0.45 * staleness + 0.35 * missingness + 0.20 * gap.gap_score) * type_boost * demand
 
 
 # ---------------------------------------------------------------------------
